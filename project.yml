@@ -10,9 +10,9 @@ targets:
     deploymentTarget: "16.0"
     sources:
       - path: Sources
-    resources:
       - path: Resources/Assets.xcassets
     info:
+      path: Resources/Info.plist
       properties:
         CFBundleDisplayName: InstaNoReels
         UILaunchScreen: {}

@@ -1,5 +1,6 @@
 .DS_Store
 *.xcodeproj/
+Resources/Info.plist
 xcuserdata/
 DerivedData/
 build/

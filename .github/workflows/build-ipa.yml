@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -37,7 +37,7 @@ jobs:
           zip -r InstaNoReels.ipa Payload
 
       - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: InstaNoReels-unsigned
           path: InstaNoReels.ipa
