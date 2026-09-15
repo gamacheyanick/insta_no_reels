@@ -13,6 +13,21 @@ stripping out:
 - The **Explore page** entirely (also blocked at both levels)
 - **Non-account search results** — search only ever returns accounts, never
   hashtags, places, or Reels
+- **"Open app" / "Get the app" nags** from the mobile site, plus the
+  `instagram://` and App Store hand-off links behind them
+- **Story ads** — these can't be blocked (Instagram serves them inline in
+  the story sequence), so the app auto-skips past any story labelled
+  "Sponsored" the moment it appears
+
+Search stays: on the mobile layout the nav's search icon is Instagram's
+Explore link, so it's rerouted to Instagram's own search page
+(`/explore/search/`) — the only `/explore/*` route allowed through — and
+results are filtered to accounts.
+
+It also smooths over the usual web-view tells so it feels like a native
+app: a proper icon and launch screen, a native splash while the first page
+loads, pull-to-refresh with haptics, and no pinch-zoom, text-selection
+handles, or long-press link previews.
 
 This is for your own personal use on your own account. It can't be published
 to the App Store (it strips Instagram features against Meta's Terms of
@@ -60,8 +75,6 @@ the regular feed.
   needed)
 - A free Apple ID (no paid Developer Program required)
 - Your iPhone + a USB cable (only for the initial pairing)
-- Your iPhone and PC on the same WiFi network at least once every ~7 days
-  (SideStore uses this to auto-refresh the signing — see step 8)
 
 ## Step-by-step: from this code to the app on your phone
 
@@ -148,13 +161,12 @@ just without Reels, ads, suggested posts, or Explore.
 
 ### 8. Auto-refresh — nothing to do manually
 
-As long as your iPhone and PC touch the same WiFi network roughly once a
-week (with SideStore's helper running on the PC, or however the current
-version defines "reachable"), SideStore refreshes the app's signing in the
-background before it expires. Opening the SideStore app occasionally is a
-good habit, since it can also trigger a refresh on demand or show you if
-pairing has lapsed (e.g. after a PC reinstall or a long time away from home
-WiFi) — if that happens, redo the pairing step above.
+SideStore refreshes the app's signing on the phone itself (via its local
+VPN tunnel and the pairing file) — no PC involved after the one-time setup.
+Keep SideStore's VPN toggle on, and open the SideStore app now and then:
+the My Apps tab shows days-until-expiry for each app, and opening the app
+also triggers a refresh on demand. If it ever reports the pairing file has
+lapsed (e.g. after restoring the phone), redo the pairing step above.
 
 ## Making code changes later
 

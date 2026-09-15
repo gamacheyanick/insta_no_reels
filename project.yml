@@ -15,7 +15,8 @@ targets:
       path: Resources/Info.plist
       properties:
         CFBundleDisplayName: InstaNoReels
-        UILaunchScreen: {}
+        UILaunchScreen:
+          UIColorName: LaunchBackground
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         UISupportedInterfaceOrientations~ipad:
