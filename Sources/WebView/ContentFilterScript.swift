@@ -18,6 +18,7 @@ enum ContentFilterScript {
         window.__instaNoReelsFlags = {
           hideReelsInsideFeed: \(AppConfig.hideReelsInsideFeed),
           autoSkipStoryAds: \(AppConfig.autoSkipStoryAds),
+          headerScrollsAway: \(AppConfig.headerScrollsAway),
           homePath: "\(AppConfig.homePath)",
           layout: "\(AppConfig.userAgentMode == .mobile ? "mobile" : "desktop")"
         };
@@ -599,25 +600,35 @@ enum ContentFilterScript {
       }
 
       // Make the feed header scroll away with the page instead of staying
-      // pinned. Instagram pins either the <header> or a wrapper around it:
-      // fixed → absolute keeps it at the top of the page (and the space
-      // the page reserves for it still lines up); sticky → relative just
-      // leaves it in the flow.
+      // pinned. Only the <header> element itself is touched — never its
+      // wrappers, which on the mobile site also host the story viewer
+      // overlay. Rather than changing positioning (which breaks those
+      // overlays), the header is slid up by however far the feed has
+      // scrolled, capped at its own height: visually identical to a
+      // non-sticky header, no layout side effects.
       function unstickHeader(header) {
-        var node = header;
-        for (var i = 0; i < 4 && node && node !== document.body; i++) {
-          var position = getComputedStyle(node).position;
-          if (position === 'fixed') {
-            node.style.setProperty('position', 'absolute', 'important');
-            node.style.setProperty('top', '0', 'important');
-            return;
+        if (header.getAttribute('data-insta-no-reels-unstuck')) return;
+        header.setAttribute('data-insta-no-reels-unstuck', 'true');
+
+        function feedScrollTop(event) {
+          var y = window.scrollY || document.documentElement.scrollTop || 0;
+          var target = event && event.target;
+          // The feed may scroll inside a container rather than the
+          // document; recognise that scroller by the posts it holds.
+          if (target && target !== document && target.scrollTop !== undefined && likeCount(target) > 0) {
+            y = Math.max(y, target.scrollTop);
           }
-          if (position === 'sticky') {
-            node.style.setProperty('position', 'relative', 'important');
-            return;
-          }
-          node = node.parentElement;
+          return y;
         }
+
+        function update(event) {
+          var height = header.getBoundingClientRect().height || 44;
+          var offset = Math.min(Math.max(feedScrollTop(event), 0), height);
+          header.style.setProperty('transform', 'translateY(-' + offset + 'px)', 'important');
+        }
+
+        document.addEventListener('scroll', update, { capture: true, passive: true });
+        update();
       }
 
       // Rearrange the feed header to: "+" on the left, wordmark centered,
@@ -641,16 +652,41 @@ enum ContentFilterScript {
         var row = childContaining(header, logo);
         if (!row || row.getAttribute('data-insta-no-reels-header') === 'done') return;
 
-        var create = header.querySelector('svg[aria-label="New post"], svg[aria-label="Create"], svg[aria-label="New Post"], a[href^="/create/"] svg');
-        var notifications = header.querySelector('svg[aria-label="Notifications"], a[href="/accounts/activity/"] svg, a[href^="/notifications"] svg');
-
         var height = Math.max(row.getBoundingClientRect().height, 44);
         row.setAttribute('data-insta-no-reels-header', 'done');
-        unstickHeader(header);
+        if (flags.headerScrollsAway) unstickHeader(header);
         row.style.setProperty('position', 'relative', 'important');
         row.style.setProperty('min-height', height + 'px', 'important');
 
         var logoWrap = clickableFor(logo);
+
+        // Identify the row's icons. Labels are matched loosely, and any
+        // unlabelled leftovers are taken in DOM order (create comes before
+        // notifications in Instagram's markup). The Following feed's back
+        // arrow is hidden: it only leads to the ranked feed we redirect
+        // away from anyway.
+        var create = null;
+        var notifications = null;
+        var leftovers = [];
+        row.querySelectorAll('svg').forEach(function (svg) {
+          if (logoWrap.contains(svg)) return;
+          var label = (svg.getAttribute('aria-label') || '').toLowerCase();
+          if (label.indexOf('chevron') !== -1) return;
+          if (label === 'back' || label.indexOf('back') === 0) {
+            hide(clickableFor(svg));
+            return;
+          }
+          if (label.indexOf('notification') !== -1 || label.indexOf('activity') !== -1) {
+            notifications = notifications || svg;
+          } else if (label.indexOf('new') !== -1 || label.indexOf('create') !== -1 || label.indexOf('post') !== -1) {
+            create = create || svg;
+          } else {
+            leftovers.push(svg);
+          }
+        });
+        if (!create && leftovers.length) create = leftovers.shift();
+        if (!notifications && leftovers.length) notifications = leftovers.shift();
+
         placeInRow(row, logoWrap, { left: '50%', transform: 'translate(-50%, -50%)' });
         if (!logoWrap.getAttribute('data-insta-no-reels-switch')) {
           logoWrap.setAttribute('data-insta-no-reels-switch', 'true');
@@ -671,14 +707,22 @@ enum ContentFilterScript {
       }
 
       // Tell the native side which account this data store is logged in
-      // as, so the switcher can label it. The profile tab in the bottom nav
-      // carries an avatar whose alt text is "<username>'s profile picture".
+      // as, so the switcher can label it. The bottom nav's profile tab
+      // links to "/<username>/" — the only single-segment link in the nav
+      // that isn't a known route. (Avatar alt text isn't used: the story
+      // tray's avatars carry the same "…'s profile picture" wording.)
+      var NON_PROFILE_ROUTES = ['explore', 'reels', 'direct', 'accounts', 'create', 'stories', 'p', 'reel', 'search', 'notifications', 'settings', 'emails', 'challenge', 'about', 'legal', 'session', 'your_activity'];
       var lastReportedUsername = '';
       function reportUsername() {
-        var img = document.querySelector('nav img[alt$="profile picture"], [role="navigation"] img[alt$="profile picture"]');
-        if (!img) return;
-        var alt = img.getAttribute('alt') || '';
-        var username = alt.replace(/['’]s profile picture$/, '').trim();
+        var home = document.querySelector('svg[aria-label="Home"]');
+        if (!home) return;
+        var nav = home.closest('nav, [role="navigation"]') || ancestor(home, 4);
+        var links = nav.querySelectorAll('a[href]');
+        var username = '';
+        for (var i = 0; i < links.length && !username; i++) {
+          var match = /^\/([A-Za-z0-9._]+)\/?(?:[?#].*)?$/.exec(links[i].getAttribute('href') || '');
+          if (match && NON_PROFILE_ROUTES.indexOf(match[1]) === -1) username = match[1];
+        }
         if (!username || username === lastReportedUsername) return;
         lastReportedUsername = username;
         postNative({ type: 'username', value: username });

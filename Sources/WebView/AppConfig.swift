@@ -29,6 +29,10 @@ enum AppConfig {
     /// Set to false to leave story ads alone.
     static let autoSkipStoryAds = true
 
+    /// Let the feed header scroll away with the page instead of staying
+    /// pinned at the top. Set to false to keep Instagram's sticky header.
+    static let headerScrollsAway = true
+
     /// Instagram's "Following" feed: chronological, only accounts you
     /// follow, no ranking and no recommendations. Used as the home feed
     /// everywhere (launch, Home tab, any navigation to "/").
