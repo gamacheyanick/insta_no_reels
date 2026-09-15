@@ -22,12 +22,29 @@ stripping out:
 Search stays: on the mobile layout the nav's search icon is Instagram's
 Explore link, so it's rerouted to Instagram's own search page
 (`/explore/search/`) — the only `/explore/*` route allowed through — and
-results are filtered to accounts.
+results are filtered to accounts. The page is put straight into
+Instagram's search-focused state (Recent list), its suggestion grid is
+hidden as a fallback, and "Cancel" goes to the home feed, so the grid of
+recommended reels is never reachable.
+
+A usage strip above Instagram's header shows how long the app has been in
+the foreground this session and how many feed posts have scrolled past
+(ads and suggested posts don't count). Being in the background for 30+
+minutes starts a fresh session.
 
 It also smooths over the usual web-view tells so it feels like a native
 app: a proper icon and launch screen, a native splash while the first page
 loads, pull-to-refresh with haptics, and no pinch-zoom, text-selection
 handles, or long-press link previews.
+
+The feed header is rearranged Socialite-style — "+" on the left, the
+wordmark centered, notifications on the right — and tapping the wordmark
+opens a **native account switcher** instead of Instagram's Following /
+Favorites picker. Each account lives in its own isolated cookie store
+(`WKWebsiteDataStore(forIdentifier:)`, hence the iOS 17 minimum), so
+"Add account" lands on a fresh login page and switching is instant with
+no re-login. Accounts are labelled with their username once the page
+reports it.
 
 This is for your own personal use on your own account. It can't be published
 to the App Store (it strips Instagram features against Meta's Terms of

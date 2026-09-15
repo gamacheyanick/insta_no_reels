@@ -270,7 +270,9 @@ enum ContentFilterScript {
         return node || el;
       }
 
-      var SPONSORED_LABELS = ['Sponsored'];
+      // The mobile site labels ads "Ad" (under the username, in both the
+      // feed and the story viewer); the desktop site uses "Sponsored".
+      var SPONSORED_LABELS = ['Ad', 'Sponsored'];
       var SUGGESTED_LABELS = [
         'Suggested for you', 'Suggested posts', 'Suggested Posts',
         'Suggested reels', 'Suggested Reels', 'Suggested threads'
@@ -333,7 +335,7 @@ enum ContentFilterScript {
       }
 
       function labelledElements(labels, root) {
-        root = root || document.querySelector('main') || document.body;
+        root = root || document.body;
         var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
         var matches = [];
         var node;
@@ -438,14 +440,240 @@ enum ContentFilterScript {
         }
       }
 
+      // Bridge to the native side (see InstagramWebView.Coordinator).
+      function postNative(message) {
+        try {
+          window.webkit.messageHandlers.instaNoReels.postMessage(message);
+        } catch (e) {}
+      }
+
+      function clickableFor(el) {
+        return el.closest('a, button, [role="button"], [role="link"]') || el.parentElement;
+      }
+
+      // Direct child of `container` that contains `el`.
+      function childContaining(container, el) {
+        var node = el;
+        while (node && node.parentElement !== container) node = node.parentElement;
+        return node;
+      }
+
+      // Force every wrapper between `el` and `row` to be non-positioned so
+      // `el`'s absolute position resolves against the row.
+      function placeInRow(row, el, styles) {
+        var node = el.parentElement;
+        while (node && node !== row) {
+          node.style.setProperty('position', 'static', 'important');
+          node = node.parentElement;
+        }
+        el.style.setProperty('position', 'absolute', 'important');
+        el.style.setProperty('top', '50%', 'important');
+        el.style.setProperty('margin', '0', 'important');
+        Object.keys(styles).forEach(function (key) {
+          el.style.setProperty(key, styles[key], 'important');
+        });
+      }
+
+      // Rearrange the feed header to: "+" on the left, wordmark centered,
+      // notifications on the right. Layout is obfuscated, so this finds the
+      // three controls by their accessibility labels / links and pins each
+      // one absolutely inside the header row instead of moving DOM nodes
+      // (which React would fight). The wordmark's tap becomes the native
+      // account switcher.
+      function styleHeader() {
+        var logo = document.querySelector('header svg[aria-label="Instagram"]');
+        if (!logo) return;
+        var header = logo.closest('header');
+        var row = childContaining(header, logo);
+        if (!row || row.getAttribute('data-insta-no-reels-header') === 'done') return;
+
+        var create = header.querySelector('svg[aria-label="New post"], svg[aria-label="Create"], svg[aria-label="New Post"], a[href^="/create/"] svg');
+        var notifications = header.querySelector('svg[aria-label="Notifications"], a[href="/accounts/activity/"] svg, a[href^="/notifications"] svg');
+
+        var height = Math.max(row.getBoundingClientRect().height, 44);
+        row.setAttribute('data-insta-no-reels-header', 'done');
+        row.style.setProperty('position', 'relative', 'important');
+        row.style.setProperty('min-height', height + 'px', 'important');
+
+        var logoWrap = clickableFor(logo);
+        placeInRow(row, logoWrap, { left: '50%', transform: 'translate(-50%, -50%)' });
+        if (!logoWrap.getAttribute('data-insta-no-reels-switch')) {
+          logoWrap.setAttribute('data-insta-no-reels-switch', 'true');
+          logoWrap.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+            postNative({ type: 'switchAccounts' });
+          }, true);
+        }
+
+        if (create) {
+          placeInRow(row, clickableFor(create), { left: '16px', transform: 'translateY(-50%)' });
+        }
+        if (notifications) {
+          placeInRow(row, clickableFor(notifications), { right: '16px', transform: 'translateY(-50%)' });
+        }
+      }
+
+      // Tell the native side which account this data store is logged in
+      // as, so the switcher can label it. The profile tab in the bottom nav
+      // carries an avatar whose alt text is "<username>'s profile picture".
+      var lastReportedUsername = '';
+      function reportUsername() {
+        var img = document.querySelector('nav img[alt$="profile picture"], [role="navigation"] img[alt$="profile picture"]');
+        if (!img) return;
+        var alt = img.getAttribute('alt') || '';
+        var username = alt.replace(/['’]s profile picture$/, '').trim();
+        if (!username || username === lastReportedUsername) return;
+        lastReportedUsername = username;
+        postNative({ type: 'username', value: username });
+      }
+
       // On the search page itself, drop hashtag / place / audio results so
       // only accounts remain (the JSON filter in bootstrap handles most of
       // this; this catches anything rendered from cached or inline data).
       function sweepSearchPage() {
-        if (location.pathname.indexOf('/explore/search') !== 0) return;
+        if (location.pathname.indexOf('/explore') !== 0) return;
         document.querySelectorAll('a[href^="/explore/tags/"], a[href^="/explore/locations/"], a[href^="/reels/audio/"]').forEach(function (a) {
           hide(tightWrapper(a));
         });
+
+        // The search page also carries a suggestion grid of reels/posts
+        // under the search box (and post results after typing). Hide the
+        // whole grid section: climb from a tile to its outermost container
+        // that doesn't also hold page chrome (search box, nav, header).
+        function isPageChrome(el) {
+          return el === document.body || el.tagName === 'MAIN' ||
+            el.querySelector('input, nav, [role="navigation"], header') !== null;
+        }
+        document.querySelectorAll('a[href^="/reel/"], a[href^="/p/"]').forEach(function (a) {
+          if (a.closest('[' + HIDDEN_MARK + ']')) return;
+          var node = a;
+          while (node.parentElement && !isPageChrome(node.parentElement)) {
+            node = node.parentElement;
+          }
+          markHidden(node);
+        });
+      }
+
+      // Put the search page straight into Instagram's "search focused"
+      // state (Recent list + Cancel), which is what replaces the
+      // suggestion grid. Programmatic focus doesn't raise the keyboard in
+      // WKWebView, so this just swaps the content. Retries a few times per
+      // page in case the box isn't rendered yet.
+      var lastSearchActivate = 0;
+      var searchActivateAttempts = 0;
+      var searchActivatePath = '';
+      function activateSearch() {
+        if (location.pathname.indexOf('/explore') !== 0) {
+          searchActivatePath = '';
+          return;
+        }
+        if (searchActivatePath !== location.pathname) {
+          searchActivatePath = location.pathname;
+          searchActivateAttempts = 0;
+        }
+        if (searchActivateAttempts >= 6) return;
+
+        var inSearchMode = Array.prototype.some.call(
+          document.querySelectorAll('button, [role="button"], a'),
+          function (el) { return (el.textContent || '').trim() === 'Cancel'; }
+        );
+        if (inSearchMode) return;
+
+        var now = Date.now();
+        if (now - lastSearchActivate < 1000) return;
+        lastSearchActivate = now;
+        searchActivateAttempts++;
+
+        var input = document.querySelector('input[type="search"], input[placeholder*="Search" i], input[aria-label*="Search" i], main input[type="text"]');
+        if (input) {
+          input.click();
+          input.focus();
+          return;
+        }
+        // The box may be a button that turns into an input once tapped.
+        // Skip the nav bar's own search icon.
+        var icons = document.querySelectorAll('svg[aria-label="Search"]');
+        for (var i = 0; i < icons.length; i++) {
+          if (icons[i].closest('nav, [role="navigation"]')) continue;
+          var target = clickableFor(icons[i]);
+          if (target) {
+            target.click();
+            return;
+          }
+        }
+      }
+
+      // Jump to the home feed via Instagram's own Home tab (instant SPA
+      // navigation); hard-navigate as a fallback.
+      function goHome() {
+        var home = document.querySelector('svg[aria-label="Home"]');
+        var link = home ? clickableFor(home) : null;
+        if (link) {
+          link.click();
+          return;
+        }
+        window.location.assign('/');
+      }
+
+      // "Cancel" on the search page normally drops back to the suggestion
+      // grid. Make it go home instead, so the grid is never reachable.
+      function hookSearchCancel() {
+        if (location.pathname.indexOf('/explore') !== 0) return;
+        var controls = document.querySelectorAll('button:not([data-insta-no-reels-cancel]), [role="button"]:not([data-insta-no-reels-cancel]), a:not([data-insta-no-reels-cancel])');
+        for (var i = 0; i < controls.length; i++) {
+          var el = controls[i];
+          if ((el.textContent || '').trim() !== 'Cancel') continue;
+          el.setAttribute('data-insta-no-reels-cancel', 'true');
+          el.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+            goHome();
+          }, true);
+        }
+      }
+
+      // Count feed posts as they scroll into view. Every feed post has
+      // exactly one Like control; when it enters the viewport, the post
+      // it belongs to counts once. Posts are keyed by permalink so a
+      // virtualized feed re-rendering the same post doesn't double count,
+      // and anything already hidden (ads, suggested) doesn't count at all.
+      var countedPosts = {};
+      function sweepPostCounter() {
+        if (location.pathname !== '/') return;
+        var viewportHeight = window.innerHeight;
+        var likes = document.querySelectorAll('svg[aria-label="Like"]:not([data-insta-no-reels-counted]), svg[aria-label="Unlike"]:not([data-insta-no-reels-counted])');
+        for (var i = 0; i < likes.length; i++) {
+          var svg = likes[i];
+          var rect = svg.getBoundingClientRect();
+          if (rect.bottom <= 0 || rect.top >= viewportHeight) continue;
+          svg.setAttribute('data-insta-no-reels-counted', 'true');
+
+          var item = feedItemFor(svg) || ancestor(svg, 6);
+          if (item.closest('[' + HIDDEN_MARK + ']')) continue;
+
+          var link = item.querySelector('a[href^="/p/"], a[href^="/reel/"]');
+          var key = link ? link.getAttribute('href') : null;
+          if (!key) {
+            var avatar = item.querySelector('img[alt$="profile picture"]');
+            key = (avatar ? avatar.getAttribute('alt') : 'post') + '|' + Math.round(rect.top + window.scrollY);
+          }
+          if (countedPosts[key]) continue;
+          countedPosts[key] = true;
+          postNative({ type: 'postViewed' });
+        }
+      }
+
+      var postCounterQueued = false;
+      function schedulePostCounter() {
+        if (postCounterQueued) return;
+        postCounterQueued = true;
+        setTimeout(function () {
+          postCounterQueued = false;
+          sweepPostCounter();
+        }, 200);
       }
 
       var sweepQueued = false;
@@ -462,7 +690,12 @@ enum ContentFilterScript {
           sweepStoryAds();
           sweepNavIcons();
           sweepSearchPage();
+          activateSearch();
+          hookSearchCancel();
           sweepAppBanners();
+          styleHeader();
+          reportUsername();
+          sweepPostCounter();
           applyViewport();
         }, 150);
       }
@@ -475,9 +708,18 @@ enum ContentFilterScript {
           childList: true,
           subtree: true
         });
+        // Plain scrolling doesn't mutate the DOM, but it's what brings
+        // posts into view for the counter. Capture phase so inner
+        // scrollers are covered too.
+        document.addEventListener('scroll', schedulePostCounter, { capture: true, passive: true });
         // A playing story ad doesn't necessarily mutate the DOM, so poll
         // for it too (cheap: returns immediately outside the story viewer).
-        setInterval(sweepStoryAds, STORY_SKIP_INTERVAL);
+        // Same for the search page, whose focus state may need a nudge
+        // after the page settles.
+        setInterval(function () {
+          sweepStoryAds();
+          activateSearch();
+        }, STORY_SKIP_INTERVAL);
       }
 
       if (document.readyState === 'loading') {

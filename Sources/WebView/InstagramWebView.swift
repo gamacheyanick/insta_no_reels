@@ -13,22 +13,31 @@ final class WebViewState: ObservableObject {
 /// /reels and /explore (belt-and-suspenders alongside the JS-level guard in
 /// ContentFilterScript, since a hard link tap does a real navigation that
 /// the JS history patch alone wouldn't catch).
+///
+/// One instance per account: the view is keyed on the account id by
+/// ContentView, so switching accounts tears this down and builds a fresh
+/// web view on that account's own data store.
 struct InstagramWebView: UIViewRepresentable {
     @ObservedObject var state: WebViewState
+    let account: Account
+    let accountStore: AccountStore
+    let usage: UsageTracker
+
+    /// Name of the `window.webkit.messageHandlers.*` bridge the injected
+    /// script posts to.
+    static let messageHandlerName = "instaNoReels"
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(state: state)
+        Coordinator(state: state, account: account, accountStore: accountStore, usage: usage)
     }
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        configuration.userContentController = Self.makeContentController()
+        configuration.websiteDataStore = account.dataStore
+        configuration.userContentController = Self.makeContentController(coordinator: context.coordinator)
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = []
 
-        // Default configuration already uses the persistent (disk-backed)
-        // WKWebsiteDataStore, so the Instagram login session survives
-        // relaunching the app — no extra setup needed.
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.customUserAgent = AppConfig.userAgentMode.userAgentString
         webView.navigationDelegate = context.coordinator
@@ -56,7 +65,13 @@ struct InstagramWebView: UIViewRepresentable {
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 
-    private static func makeContentController() -> WKUserContentController {
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        // The content controller holds the handler strongly; break the
+        // reference when the account's web view goes away.
+        uiView.configuration.userContentController.removeScriptMessageHandler(forName: messageHandlerName)
+    }
+
+    private static func makeContentController(coordinator: Coordinator) -> WKUserContentController {
         let controller = WKUserContentController()
 
         let scripts = [ContentFilterScript.flags, ContentFilterScript.bootstrap, ContentFilterScript.cleanup]
@@ -65,23 +80,50 @@ struct InstagramWebView: UIViewRepresentable {
                 WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true)
             )
         }
+        controller.add(coordinator, name: messageHandlerName)
         return controller
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         weak var webView: WKWebView?
         private let state: WebViewState
+        private let account: Account
+        private let accountStore: AccountStore
+        private let usage: UsageTracker
 
         private let blockedPathPrefixes = ["/reels", "/explore"]
         private let appStoreHosts = ["apps.apple.com", "itunes.apple.com"]
 
-        init(state: WebViewState) {
+        init(state: WebViewState, account: Account, accountStore: AccountStore, usage: UsageTracker) {
             self.state = state
+            self.account = account
+            self.accountStore = accountStore
+            self.usage = usage
         }
 
         @objc func handleRefresh(_ sender: UIRefreshControl) {
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             webView?.reload()
+        }
+
+        // MARK: - Messages from the injected script
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard let body = message.body as? [String: Any], let type = body["type"] as? String else { return }
+
+            switch type {
+            case "switchAccounts":
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                accountStore.isPickerPresented = true
+            case "username":
+                if let username = body["value"] as? String, !username.isEmpty {
+                    accountStore.setUsername(username, for: account.id)
+                }
+            case "postViewed":
+                usage.recordPostViewed()
+            default:
+                break
+            }
         }
 
         // MARK: - Navigation lifecycle
@@ -192,7 +234,6 @@ struct InstagramWebView: UIViewRepresentable {
         // Instagram's post/story composer asks for camera/mic access via
         // getUserMedia(). Grant it (subject to the usual iOS system
         // permission prompt) so capture actually works.
-        @available(iOS 15.0, *)
         func webView(
             _ webView: WKWebView,
             requestMediaCapturePermissionFor origin: WKSecurityOrigin,
