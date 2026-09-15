@@ -33,20 +33,26 @@ final class AccountStore: ObservableObject {
     private let currentKey = "currentAccountID"
 
     init() {
-        if let data = defaults.data(forKey: accountsKey),
+        let defaults = UserDefaults.standard
+        let loaded: [Account]
+        if let data = defaults.data(forKey: "accounts"),
            let saved = try? JSONDecoder().decode([Account].self, from: data),
            !saved.isEmpty {
-            accounts = saved
+            loaded = saved
         } else {
-            accounts = [Account(storeID: nil, username: nil)]
+            loaded = [Account(storeID: nil, username: nil)]
         }
 
-        let savedCurrent = defaults.string(forKey: currentKey)
-        if let savedCurrent, accounts.contains(where: { $0.id == savedCurrent }) {
-            currentID = savedCurrent
+        let savedCurrent = defaults.string(forKey: "currentAccountID")
+        let initialCurrent: String
+        if let savedCurrent, loaded.contains(where: { $0.id == savedCurrent }) {
+            initialCurrent = savedCurrent
         } else {
-            currentID = accounts[0].id
+            initialCurrent = loaded[0].id
         }
+
+        accounts = loaded
+        currentID = initialCurrent
     }
 
     var current: Account {
