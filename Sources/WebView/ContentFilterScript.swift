@@ -237,6 +237,437 @@ enum ContentFilterScript {
     })();
     """#
 
+    /// In-app story viewer, used by the app-built story row on the
+    /// Following feed. Fetches each person's story items from Instagram's
+    /// reels endpoint (same session), plays them in sequence across people
+    /// with no page loads, and marks them seen. Exposed to `cleanup` as
+    /// `window.__instaNoReelsViewer`.
+    static let viewer = #"""
+    (function () {
+      'use strict';
+
+      var IG_APP_ID = '936619743392459';
+      var IMAGE_DURATION = 5000;
+      var HOLD_DELAY = 220;
+      var MARK = 'data-insta-no-reels-viewer';
+
+      function igFetch(path) {
+        return fetch(path, {
+          credentials: 'include',
+          headers: { 'x-ig-app-id': IG_APP_ID, 'x-requested-with': 'XMLHttpRequest', 'accept': 'application/json' }
+        }).then(function (response) { return response.ok ? response.json() : null; });
+      }
+
+      function csrfToken() {
+        var match = /(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '');
+        return match ? match[1] : '';
+      }
+
+      function timeAgo(takenAt) {
+        var diff = Math.max(0, Math.floor(Date.now() / 1000 - takenAt));
+        if (diff < 60) return diff + 's';
+        if (diff < 3600) return Math.floor(diff / 60) + 'm';
+        if (diff < 86400) return Math.floor(diff / 3600) + 'h';
+        return Math.floor(diff / 86400) + 'd';
+      }
+
+      function bestImage(item) {
+        var candidates = item.image_versions2 && item.image_versions2.candidates;
+        return candidates && candidates.length ? candidates[0].url : '';
+      }
+
+      function bestVideo(item) {
+        var versions = item.video_versions;
+        return versions && versions.length ? versions[0].url : '';
+      }
+
+      // ---- Data ------------------------------------------------------
+      var reelCache = {};
+      function loadReel(reel) {
+        var key = String(reel.userPk);
+        if (reelCache[key]) return reelCache[key];
+        reelCache[key] = igFetch('/api/v1/feed/reels_media/?reel_ids=' + encodeURIComponent(key)).then(function (json) {
+          var data = null;
+          if (json && Array.isArray(json.reels_media) && json.reels_media.length) data = json.reels_media[0];
+          else if (json && json.reels && json.reels[key]) data = json.reels[key];
+          var items = data && Array.isArray(data.items) ? data.items : [];
+          return { reelId: data && data.id ? String(data.id) : key, items: items };
+        }).catch(function () {
+          delete reelCache[key];
+          return { reelId: key, items: [] };
+        });
+        return reelCache[key];
+      }
+
+      function markSeen(reel, reelId, item) {
+        var csrf = csrfToken();
+        if (!csrf || !item) return;
+        var body = new URLSearchParams({
+          reelMediaId: String(item.pk || ''),
+          reelMediaOwnerId: String(reel.userPk),
+          reelId: String(reelId),
+          reelMediaTakenAt: String(item.taken_at || 0),
+          viewSeenAt: String(Math.floor(Date.now() / 1000))
+        });
+        fetch('/stories/reel/seen', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'x-csrftoken': csrf,
+            'x-ig-app-id': IG_APP_ID,
+            'x-requested-with': 'XMLHttpRequest',
+            'content-type': 'application/x-www-form-urlencoded'
+          },
+          body: body.toString()
+        }).catch(function () {});
+      }
+
+      // ---- UI --------------------------------------------------------
+      var ui = null;
+      var state = null;
+
+      function el(tag, style, attrs) {
+        var node = document.createElement(tag);
+        if (style) node.style.cssText = style;
+        if (attrs) Object.keys(attrs).forEach(function (key) { node.setAttribute(key, attrs[key]); });
+        return node;
+      }
+
+      function buildUI() {
+        var root = el('div', 'position:fixed;inset:0;z-index:2147483000;background:#000;color:#fff;font-family:-apple-system,system-ui,sans-serif;-webkit-user-select:none;user-select:none;touch-action:none;overflow:hidden;');
+        root.setAttribute(MARK, 'true');
+
+        var style = document.createElement('style');
+        style.textContent = '@keyframes inr-spin{to{transform:rotate(360deg)}}';
+        root.appendChild(style);
+
+        var media = el('div', 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;');
+        var img = el('img', 'max-width:100%;max-height:100%;object-fit:contain;display:none;', { alt: '' });
+        var video = el('video', 'max-width:100%;max-height:100%;object-fit:contain;display:none;', { playsinline: '', 'webkit-playsinline': '', preload: 'auto' });
+        var loading = el('div', 'position:absolute;width:28px;height:28px;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:inr-spin .8s linear infinite;');
+        media.appendChild(img);
+        media.appendChild(video);
+        media.appendChild(loading);
+        root.appendChild(media);
+
+        var top = el('div', 'position:absolute;left:0;right:0;top:0;padding:10px 10px 24px;background:linear-gradient(rgba(0,0,0,.55),rgba(0,0,0,0));');
+        var progress = el('div', 'display:flex;gap:3px;height:2px;');
+        var bar = el('div', 'display:flex;align-items:center;gap:10px;margin-top:12px;');
+        var avatar = el('img', 'width:32px;height:32px;border-radius:50%;object-fit:cover;background:#333;', { alt: '' });
+        var name = el('span', 'font-weight:600;font-size:14px;');
+        var time = el('span', 'opacity:.7;font-size:14px;');
+        var spacer = el('span', 'flex:1;');
+        var mute = el('button', 'background:none;border:0;color:#fff;font-size:20px;padding:4px 8px;line-height:1;');
+        var close = el('button', 'background:none;border:0;color:#fff;font-size:30px;padding:0 6px;line-height:1;');
+        close.textContent = '×';
+        bar.appendChild(avatar);
+        bar.appendChild(name);
+        bar.appendChild(time);
+        bar.appendChild(spacer);
+        bar.appendChild(mute);
+        bar.appendChild(close);
+        top.appendChild(progress);
+        top.appendChild(bar);
+        root.appendChild(top);
+
+        ui = { root: root, media: media, img: img, video: video, loading: loading, progress: progress, avatar: avatar, name: name, time: time, mute: mute, close: close };
+
+        close.addEventListener('click', function (event) { event.stopPropagation(); closeViewer(); });
+        mute.addEventListener('click', function (event) {
+          event.stopPropagation();
+          state.muted = !state.muted;
+          video.muted = state.muted;
+          renderMute();
+        });
+        // Keep taps on the header from counting as story navigation.
+        top.addEventListener('pointerdown', function (event) { event.stopPropagation(); });
+
+        media.addEventListener('pointerdown', onPointerDown);
+        media.addEventListener('pointerup', onPointerUp);
+        media.addEventListener('pointercancel', onPointerCancel);
+        video.addEventListener('ended', function () { if (state && !state.paused) next(); });
+        video.addEventListener('loadedmetadata', function () { if (state) hideLoading(); });
+        video.addEventListener('waiting', function () { if (state) showLoading(); });
+        video.addEventListener('playing', function () { if (state) hideLoading(); });
+      }
+
+      function renderMute() {
+        ui.mute.textContent = state.muted ? '🔇' : '🔊';
+        ui.mute.style.display = state.currentIsVideo ? '' : 'none';
+      }
+
+      function showLoading() { ui.loading.style.display = ''; }
+      function hideLoading() { ui.loading.style.display = 'none'; }
+
+      // ---- Gestures: tap = prev/next, hold = pause, swipe down = close,
+      // swipe sideways = prev/next person.
+      var pointer = null;
+      function onPointerDown(event) {
+        if (!state) return;
+        pointer = { x: event.clientX, y: event.clientY, at: Date.now(), held: false, timer: null };
+        pointer.timer = setTimeout(function () {
+          if (!pointer) return;
+          pointer.held = true;
+          pause();
+        }, HOLD_DELAY);
+      }
+
+      function onPointerUp(event) {
+        if (!state || !pointer) return;
+        clearTimeout(pointer.timer);
+        var dx = event.clientX - pointer.x;
+        var dy = event.clientY - pointer.y;
+        var held = pointer.held;
+        pointer = null;
+        if (held) {
+          resume();
+          return;
+        }
+        if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)) {
+          if (dx < 0) showUser(state.userIndex + 1, false); else showUser(state.userIndex - 1, false);
+          return;
+        }
+        if (dy > 80) {
+          closeViewer();
+          return;
+        }
+        if (event.clientX < window.innerWidth / 3) prev(); else next();
+      }
+
+      function onPointerCancel() {
+        if (pointer) clearTimeout(pointer.timer);
+        if (pointer && pointer.held) resume();
+        pointer = null;
+      }
+
+      // ---- Playback --------------------------------------------------
+      function stopTimer() {
+        if (state && state.raf) cancelAnimationFrame(state.raf);
+        if (state) state.raf = 0;
+      }
+
+      function setFill(index, fraction) {
+        var bars = ui.progress.children;
+        for (var i = 0; i < bars.length; i++) {
+          var fill = bars[i].firstChild;
+          fill.style.width = i < index ? '100%' : (i === index ? (Math.min(1, Math.max(0, fraction)) * 100) + '%' : '0%');
+        }
+      }
+
+      function tick() {
+        if (!state || state.paused) return;
+        var fraction;
+        if (state.currentIsVideo) {
+          var duration = ui.video.duration;
+          fraction = duration ? ui.video.currentTime / duration : 0;
+        } else {
+          var elapsed = state.elapsedBeforePause + (Date.now() - state.startedAt);
+          fraction = elapsed / IMAGE_DURATION;
+          if (fraction >= 1) {
+            setFill(state.itemIndex, 1);
+            next();
+            return;
+          }
+        }
+        setFill(state.itemIndex, fraction);
+        state.raf = requestAnimationFrame(tick);
+      }
+
+      function pause() {
+        if (!state || state.paused) return;
+        state.paused = true;
+        if (state.currentIsVideo) ui.video.pause();
+        else state.elapsedBeforePause += Date.now() - state.startedAt;
+        stopTimer();
+      }
+
+      function resume() {
+        if (!state || !state.paused) return;
+        state.paused = false;
+        if (state.currentIsVideo) ui.video.play().catch(function () {});
+        else state.startedAt = Date.now();
+        tick();
+      }
+
+      function buildProgress(count) {
+        ui.progress.innerHTML = '';
+        for (var i = 0; i < count; i++) {
+          var track = el('div', 'flex:1;background:rgba(255,255,255,.35);border-radius:2px;overflow:hidden;');
+          var fill = el('div', 'width:0%;height:100%;background:#fff;');
+          track.appendChild(fill);
+          ui.progress.appendChild(track);
+        }
+      }
+
+      function preload(item) {
+        if (!item) return;
+        if (item.media_type === 2 && bestVideo(item)) {
+          var v = document.createElement('video');
+          v.preload = 'auto';
+          v.muted = true;
+          v.src = bestVideo(item);
+        } else if (bestImage(item)) {
+          var i = new Image();
+          i.src = bestImage(item);
+        }
+      }
+
+      function showItem() {
+        stopTimer();
+        var reel = state.reels[state.userIndex];
+        var item = state.items[state.itemIndex];
+        if (!item) { next(); return; }
+
+        ui.avatar.src = reel.pic || '';
+        ui.name.textContent = reel.username;
+        ui.time.textContent = item.taken_at ? timeAgo(item.taken_at) : '';
+        setFill(state.itemIndex, 0);
+        state.paused = false;
+        state.elapsedBeforePause = 0;
+
+        var videoURL = item.media_type === 2 ? bestVideo(item) : '';
+        state.currentIsVideo = !!videoURL;
+        renderMute();
+
+        if (videoURL) {
+          ui.img.style.display = 'none';
+          ui.img.removeAttribute('src');
+          ui.video.style.display = 'block';
+          ui.video.muted = state.muted;
+          ui.video.src = videoURL;
+          showLoading();
+          ui.video.play().catch(function () {
+            // Autoplay with sound refused: fall back to muted.
+            state.muted = true;
+            ui.video.muted = true;
+            renderMute();
+            ui.video.play().catch(function () {});
+          });
+        } else {
+          ui.video.pause();
+          ui.video.removeAttribute('src');
+          ui.video.load();
+          ui.video.style.display = 'none';
+          ui.img.style.display = 'block';
+          showLoading();
+          var url = bestImage(item);
+          var token = ++state.loadToken;
+          var image = new Image();
+          image.onload = image.onerror = function () {
+            if (!state || token !== state.loadToken) return;
+            ui.img.src = url;
+            hideLoading();
+            state.startedAt = Date.now();
+          };
+          image.src = url;
+          state.startedAt = Date.now() + 60000; // holds the bar at 0 until loaded
+        }
+        tick();
+
+        markSeen(reel, state.reelId, item);
+        preload(state.items[state.itemIndex + 1]);
+        if (state.itemIndex === state.items.length - 1 && state.reels[state.userIndex + 1]) {
+          loadReel(state.reels[state.userIndex + 1]).then(function (data) { preload(data.items[0]); });
+        }
+      }
+
+      function showUser(index, fromEnd) {
+        if (!state) return;
+        if (index < 0) { index = 0; fromEnd = false; }
+        if (index >= state.reels.length) { closeViewer(); return; }
+        stopTimer();
+        var direction = index >= state.userIndex ? 1 : -1;
+        state.userIndex = index;
+        var reel = state.reels[index];
+        var token = ++state.loadToken;
+        showLoading();
+        ui.progress.innerHTML = '';
+        ui.avatar.src = reel.pic || '';
+        ui.name.textContent = reel.username;
+        ui.time.textContent = '';
+
+        loadReel(reel).then(function (data) {
+          if (!state || token !== state.loadToken) return;
+          if (!data.items.length) {
+            // Nothing to show (expired, or the request failed): skip past.
+            var nextIndex = index + direction;
+            if (nextIndex < 0 || nextIndex >= state.reels.length) closeViewer(); else showUser(nextIndex, fromEnd);
+            return;
+          }
+          state.items = data.items;
+          state.reelId = data.reelId;
+          state.itemIndex = fromEnd ? data.items.length - 1 : 0;
+          buildProgress(data.items.length);
+          showItem();
+        });
+      }
+
+      function next() {
+        if (!state) return;
+        if (state.itemIndex + 1 < state.items.length) {
+          state.itemIndex += 1;
+          showItem();
+        } else {
+          var reel = state.reels[state.userIndex];
+          if (state.onUserSeen) { try { state.onUserSeen(reel.username); } catch (e) {} }
+          showUser(state.userIndex + 1, false);
+        }
+      }
+
+      function prev() {
+        if (!state) return;
+        if (state.itemIndex > 0) {
+          state.itemIndex -= 1;
+          showItem();
+        } else if (state.userIndex > 0) {
+          showUser(state.userIndex - 1, true);
+        } else {
+          showItem(); // restart the first one
+        }
+      }
+
+      function closeViewer() {
+        if (!state) return;
+        stopTimer();
+        ui.video.pause();
+        ui.video.removeAttribute('src');
+        ui.video.load();
+        ui.img.removeAttribute('src');
+        ui.root.remove();
+        document.documentElement.style.overflow = state.previousOverflow;
+        state = null;
+      }
+
+      function open(reels, startIndex, onUserSeen) {
+        if (!reels || !reels.length) return false;
+        if (!ui) buildUI();
+        if (state) closeViewer();
+        state = {
+          reels: reels,
+          userIndex: startIndex || 0,
+          itemIndex: 0,
+          items: [],
+          reelId: '',
+          paused: false,
+          muted: false,
+          currentIsVideo: false,
+          startedAt: 0,
+          elapsedBeforePause: 0,
+          raf: 0,
+          loadToken: 0,
+          onUserSeen: onUserSeen,
+          previousOverflow: document.documentElement.style.overflow
+        };
+        document.documentElement.style.overflow = 'hidden';
+        document.body.appendChild(ui.root);
+        showUser(state.userIndex, false);
+        return true;
+      }
+
+      window.__instaNoReelsViewer = { open: open, close: closeViewer, isOpen: function () { return !!state; } };
+    })();
+    """#
+
     /// Runs after the DOM exists. Hides nav icons and sweeps newly-rendered
     /// posts for ads/suggested content via a MutationObserver, since
     /// Instagram is a client-rendered single-page app that keeps injecting
@@ -482,6 +913,7 @@ enum ContentFilterScript {
           if (!text || labels.indexOf(text) === -1) continue;
           var el = node.parentElement;
           if (!el || el.closest('[' + HIDDEN_MARK + ']')) continue;
+          if (el.closest('[data-insta-no-reels-viewer]')) continue;
           matches.push(el);
         }
         return matches;
@@ -1075,11 +1507,37 @@ enum ContentFilterScript {
           else rest.push(item);
         });
 
+        // Everything the in-app viewer needs, in row order, plus each
+        // person's ring so it can be greyed once their story is watched.
+        var viewerReels = [];
+        var storyRings = {};
+        function reelFor(item) {
+          return {
+            userPk: item.user.pk || item.id,
+            username: item.user.username,
+            pic: item.user.profile_pic_url || '',
+            seen: !!(item.seen && item.latest_reel_media && item.seen >= item.latest_reel_media)
+          };
+        }
+        function openAt(index, fallbackHref) {
+          var viewer = window.__instaNoReelsViewer;
+          var opened = viewer && viewer.open(viewerReels, index, function (username) {
+            var ring = storyRings[username];
+            if (ring) ring.style.background = seenRing;
+          });
+          if (!opened) window.location.assign(fallbackHref);
+        }
+
         // "Your story" first: the user's own story if they have one, else
         // a + badge that opens Instagram's create flow (the header's +).
         if (ownProfile) {
           if (own) {
-            tray.appendChild(makeItem({ href: '/stories/' + ownProfile.username + '/', pic: ownProfile.pic, ring: seenRing, label: 'Your story', muted: true }));
+            viewerReels.push(reelFor(own));
+            var ownIndex = viewerReels.length - 1;
+            var ownHref = '/stories/' + ownProfile.username + '/';
+            var ownLink = makeItem({ href: ownHref, pic: ownProfile.pic, ring: seenRing, label: 'Your story', muted: true, onClick: function () { openAt(ownIndex, ownHref); } });
+            storyRings[ownProfile.username] = ownLink.firstChild;
+            tray.appendChild(ownLink);
           } else {
             tray.appendChild(makeItem({
               href: '#', pic: ownProfile.pic, ring: 'transparent', label: 'Your story', muted: true, plusBadge: true,
@@ -1094,12 +1552,16 @@ enum ContentFilterScript {
 
         rest.forEach(function (item) {
           var user = item.user;
-          var seen = item.seen && item.latest_reel_media && item.seen >= item.latest_reel_media;
-          tray.appendChild(makeItem({ href: '/stories/' + user.username + '/', pic: user.profile_pic_url, ring: seen ? seenRing : unseenRing, label: user.username }));
+          var reel = reelFor(item);
+          viewerReels.push(reel);
+          var index = viewerReels.length - 1;
+          var href = '/stories/' + user.username + '/';
+          var link = makeItem({ href: href, pic: user.profile_pic_url, ring: reel.seen ? seenRing : unseenRing, label: user.username, onClick: function () { openAt(index, href); } });
+          storyRings[user.username] = link.firstChild;
+          tray.appendChild(link);
         });
 
-        // Order for chaining one person's story into the next (bootstrap
-        // reads this when Instagram exits a story).
+        // Order for the direct-URL fallback chaining in bootstrap.
         try {
           sessionStorage.setItem('insta-no-reels-story-order', JSON.stringify(rest.map(function (item) { return item.user.username; })));
         } catch (e) {}

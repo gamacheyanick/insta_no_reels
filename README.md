@@ -37,7 +37,14 @@ recommended reels is never reachable.
 Instagram doesn't render the story tray on the Following feed, so the app
 builds its own from Instagram's internal tray endpoint (using your
 session) and places it above the first post: gradient ring = unseen,
-grey = seen, tap to open that person's story.
+grey = seen. Tapping opens a **built-in story viewer** (Instagram's own
+viewer only plays one person at a time when reached by URL): stories are
+fetched from Instagram's reels endpoint and played in sequence across
+people with no page loads — images for 5s, videos to the end, progress
+bars, tap left/right for previous/next, hold to pause, swipe sideways to
+change person, swipe down to close. Watched stories are marked seen
+through Instagram's endpoint. Replies and reactions aren't available
+inside the viewer.
 
 A usage strip above Instagram's header shows how long the app has been in
 the foreground this session and how many feed posts have scrolled past

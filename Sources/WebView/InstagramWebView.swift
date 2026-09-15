@@ -74,7 +74,7 @@ struct InstagramWebView: UIViewRepresentable {
     private static func makeContentController(coordinator: Coordinator) -> WKUserContentController {
         let controller = WKUserContentController()
 
-        let scripts = [ContentFilterScript.flags, ContentFilterScript.bootstrap, ContentFilterScript.cleanup]
+        let scripts = [ContentFilterScript.flags, ContentFilterScript.bootstrap, ContentFilterScript.viewer, ContentFilterScript.cleanup]
         for source in scripts {
             controller.addUserScript(
                 WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true)
