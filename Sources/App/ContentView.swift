@@ -32,7 +32,10 @@ struct ContentView: View {
                     deepLinks: deepLinks
                 )
                 .id(accounts.current.id)
-                .ignoresSafeArea(edges: .bottom)
+                // Container only: extend under the home indicator, but
+                // still shrink for the keyboard so Instagram's message
+                // composer sits on top of it and stays visible while typing.
+                .ignoresSafeArea(.container, edges: .bottom)
             }
 
             // Covers the blank/white page while instagram.com does its
@@ -108,7 +111,9 @@ private struct UsageBar: View {
                 .monospacedDigit()
             Text("·")
             Text(usage.postsText)
+                .font(.system(size: usage.postsFontSize, weight: .semibold))
                 .foregroundStyle(usage.isOverPostsThreshold ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+                .animation(.easeOut(duration: 0.25), value: usage.postsGrowthLevel)
         }
         .font(.subheadline.weight(.semibold))
         .foregroundStyle(.secondary)

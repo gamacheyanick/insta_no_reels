@@ -58,6 +58,17 @@ final class UsageTracker: ObservableObject {
         postsViewed > Self.postsWarningThreshold
     }
 
+    /// How many full blocks of `postsWarningStep` posts have scrolled by —
+    /// the counter's text grows a little with each one.
+    var postsGrowthLevel: Int {
+        postsViewed / Self.postsWarningStep
+    }
+
+    /// Base 15pt, +1.5pt per block, capped so the bar never runs away.
+    var postsFontSize: CGFloat {
+        min(15 + CGFloat(postsGrowthLevel) * 1.5, 30)
+    }
+
     var postsText: String {
         let base = postsViewed == 1 ? "1 post" : "\(postsViewed) posts"
         let over = postsViewed - Self.postsWarningThreshold

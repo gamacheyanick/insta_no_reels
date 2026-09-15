@@ -915,18 +915,45 @@ enum ContentFilterScript {
         return false;
       }
 
+      // Several sweeps look for short labels ("Ad", "Suggested for you",
+      // "Your note"...). Walking the whole page's text once per sweep and
+      // indexing it is far cheaper than one walk per label set — that
+      // difference is felt as scroll jank on a long feed.
+      var labelIndex = null;
+      function buildLabelIndex() {
+        var index = {};
+        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        var node;
+        while ((node = walker.nextNode())) {
+          var text = (node.textContent || '').trim();
+          if (!text || text.length > 40) continue;
+          (index[text] || (index[text] = [])).push(node.parentElement);
+        }
+        return index;
+      }
+
+      function usableLabel(el) {
+        return el && el.isConnected &&
+          !el.closest('[' + HIDDEN_MARK + ']') &&
+          !el.closest('[data-insta-no-reels-viewer]');
+      }
+
       function labelledElements(labels, root) {
-        root = root || document.body;
+        if (!root || root === document.body) {
+          if (!labelIndex) labelIndex = buildLabelIndex();
+          var found = [];
+          labels.forEach(function (label) {
+            (labelIndex[label] || []).forEach(function (el) { if (usableLabel(el)) found.push(el); });
+          });
+          return found;
+        }
         var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
         var matches = [];
         var node;
         while ((node = walker.nextNode())) {
           var text = (node.textContent || '').trim();
           if (!text || labels.indexOf(text) === -1) continue;
-          var el = node.parentElement;
-          if (!el || el.closest('[' + HIDDEN_MARK + ']')) continue;
-          if (el.closest('[data-insta-no-reels-viewer]')) continue;
-          matches.push(el);
+          if (usableLabel(node.parentElement)) matches.push(node.parentElement);
         }
         return matches;
       }
@@ -978,6 +1005,10 @@ enum ContentFilterScript {
       var storySkipAttempts = 0;
       function sweepStoryAds() {
         if (!flags.autoSkipStoryAds) return;
+        if (!inStories() && !document.querySelector('[role="dialog"], [aria-modal="true"]')) {
+          storySkipAttempts = 0;
+          return;
+        }
         var labels = labelledElements(SPONSORED_LABELS, document.body);
         var storyAd = null;
         for (var i = 0; i < labels.length; i++) {
@@ -1053,7 +1084,8 @@ enum ContentFilterScript {
       // feed — profile grids also link to /reel/ and must be left alone.
       function sweepFeedReels() {
         if (!flags.hideReelsInsideFeed || location.pathname !== '/') return;
-        document.querySelectorAll('a[href^="/reel/"]').forEach(function (a) {
+        document.querySelectorAll('a[href^="/reel/"]:not([data-insta-no-reels-reel])').forEach(function (a) {
+          a.setAttribute('data-insta-no-reels-reel', 'checked');
           if (a.closest('[' + HIDDEN_MARK + ']')) return;
           var item = feedItemFor(a);
           if (item) markHidden(item);
@@ -1151,24 +1183,36 @@ enum ContentFilterScript {
         if (header.getAttribute('data-insta-no-reels-unstuck')) return;
         header.setAttribute('data-insta-no-reels-unstuck', 'true');
 
+        var headerHeight = 0;
+        var feedScroller = null;
         function feedScrollTop(event) {
           var y = window.scrollY || document.documentElement.scrollTop || 0;
           var target = event && event.target;
           // The feed may scroll inside a container rather than the
-          // document; recognise that scroller by the posts it holds.
-          if (target && target !== document && target.scrollTop !== undefined && likeCount(target) > 0) {
-            y = Math.max(y, target.scrollTop);
+          // document; recognise that scroller by the posts it holds —
+          // checked at most every couple of seconds per element, never on
+          // every scroll event.
+          if (target && target !== document && target.scrollTop !== undefined) {
+            if (target !== feedScroller) {
+              var now = Date.now();
+              if (!target.__inrCheckedAt || now - target.__inrCheckedAt > 2000) {
+                target.__inrCheckedAt = now;
+                if (likeCount(target) > 0) feedScroller = target;
+              }
+            }
+            if (target === feedScroller) y = Math.max(y, target.scrollTop);
           }
           return y;
         }
 
         function update(event) {
-          var height = header.getBoundingClientRect().height || 44;
-          var offset = Math.min(Math.max(feedScrollTop(event), 0), height);
+          if (!headerHeight) headerHeight = header.getBoundingClientRect().height || 44;
+          var offset = Math.min(Math.max(feedScrollTop(event), 0), headerHeight);
           header.style.setProperty('transform', 'translateY(-' + offset + 'px)', 'important');
         }
 
         document.addEventListener('scroll', update, { capture: true, passive: true });
+        window.addEventListener('resize', function () { headerHeight = 0; });
         update();
       }
 
@@ -1688,13 +1732,26 @@ enum ContentFilterScript {
         }
         loadStoriesTray();
         if (!storiesTray || storiesTray.isConnected || !storiesTray.childElementCount) return;
-        // Place it right above the first post, which is guaranteed to be
-        // in the visible flow below the header.
+        // Re-inserting while scrolled down would shift the content under
+        // the thumb; wait until the user is back near the top.
+        if ((window.scrollY || document.documentElement.scrollTop || 0) > 200) return;
+
         var firstLike = document.querySelector('svg[aria-label="Like"], svg[aria-label="Unlike"]');
         if (!firstLike) return;
-        var firstPost = feedItemFor(firstLike) || ancestor(firstLike, 6);
-        if (firstPost && firstPost.parentElement) {
-          firstPost.parentElement.insertBefore(storiesTray, firstPost);
+        var entry = feedItemFor(firstLike) || ancestor(firstLike, 6);
+        // Climb through wrappers holding only this post, up to the list
+        // of posts itself.
+        while (entry.parentElement && !isPageChrome(entry.parentElement) &&
+               likeCount(entry.parentElement) === likeCount(entry)) {
+          entry = entry.parentElement;
+        }
+        var list = entry.parentElement;
+        if (list && !isPageChrome(list) && list.parentElement && likeCount(list) > likeCount(entry)) {
+          // Just above the list, outside it: Instagram's re-renders of
+          // the list can't remove it, so it never jumps.
+          list.parentElement.insertBefore(storiesTray, list);
+        } else if (entry.parentElement) {
+          entry.parentElement.insertBefore(storiesTray, entry);
         }
       }
 
@@ -1872,13 +1929,27 @@ enum ContentFilterScript {
       }
 
       var sweepQueued = false;
+      var sweepDeferredSince = 0;
+      var lastScrollAt = 0;
       function scheduleSweep() {
         if (sweepQueued) return;
         sweepQueued = true;
         // Coalesce bursts of DOM mutations (Instagram fires a lot while
-        // scrolling) into one pass every ~150ms.
+        // scrolling) into one pass every ~150ms — and while the user is
+        // actively scrolling, hold the pass until the scroll settles (up
+        // to 600ms), so the work doesn't land mid-gesture.
         setTimeout(function () {
           sweepQueued = false;
+          var now = Date.now();
+          if (now - lastScrollAt < 120) {
+            if (!sweepDeferredSince) sweepDeferredSince = now;
+            if (now - sweepDeferredSince < 600) {
+              scheduleSweep();
+              return;
+            }
+          }
+          sweepDeferredSince = 0;
+          labelIndex = null;
           sweepSponsored();
           sweepSuggested();
           sweepFeedReels();
@@ -1913,13 +1984,17 @@ enum ContentFilterScript {
         // Plain scrolling doesn't mutate the DOM, but it's what brings
         // posts into view for the counter. Capture phase so inner
         // scrollers are covered too.
-        document.addEventListener('scroll', schedulePostCounter, { capture: true, passive: true });
+        document.addEventListener('scroll', function () {
+          lastScrollAt = Date.now();
+          schedulePostCounter();
+        }, { capture: true, passive: true });
         document.addEventListener('scroll', onInboxScroll, { capture: true, passive: true });
         // A playing story ad doesn't necessarily mutate the DOM, so poll
         // for it too (cheap: returns immediately outside the story viewer).
         // Same for the search page, whose focus state may need a nudge
         // after the page settles.
         setInterval(function () {
+          labelIndex = null;
           sweepStoryAds();
           activateSearch();
           sweepRankedHome();
