@@ -70,6 +70,9 @@ enum ContentFilterScript {
             if (url) {
               var resolved = new URL(url, location.href);
               var path = resolved.pathname;
+              if (leavingStoryFor(path)) {
+                return; // chained to the next story instead
+              }
               if (path === '/' && !resolved.searchParams.has('variant')) {
                 // Ranked home feed is never shown — always the Following feed.
                 args[2] = flags.homePath || '/?variant=following';
@@ -85,6 +88,34 @@ enum ContentFilterScript {
           return original.apply(this, args);
         };
       }
+      // Stories opened from the app's story row are direct /stories/<user>/
+      // loads, which Instagram plays in isolation and then exits to "/".
+      // The row stores its order; when Instagram tries to leave a story
+      // for "/", go to the next person instead (Following feed after the
+      // last one). Users not in the row (e.g. opened from a profile) are
+      // left to Instagram.
+      var STORY_ORDER_KEY = 'insta-no-reels-story-order';
+      function storyUsername(path) {
+        var match = /^\/stories\/([^\/]+)\/?/.exec(path || '');
+        return match ? match[1] : null;
+      }
+      function pathAfterStory() {
+        var current = storyUsername(location.pathname);
+        if (!current) return null;
+        var order = [];
+        try { order = JSON.parse(sessionStorage.getItem(STORY_ORDER_KEY) || '[]'); } catch (e) {}
+        var index = order.indexOf(current);
+        if (index === -1) return null;
+        return index + 1 < order.length ? '/stories/' + order[index + 1] + '/' : (flags.homePath || '/?variant=following');
+      }
+      function leavingStoryFor(path) {
+        if (path !== '/' || !storyUsername(location.pathname)) return false;
+        var next = pathAfterStory();
+        if (!next) return false;
+        window.location.assign(next);
+        return true;
+      }
+
       guardHistoryMethod('pushState');
       guardHistoryMethod('replaceState');
 
@@ -117,7 +148,20 @@ enum ContentFilterScript {
         event.stopImmediatePropagation();
       }, true);
 
+      var previousPath = location.pathname;
       window.addEventListener('popstate', function () {
+        var cameFromStory = storyUsername(previousPath);
+        previousPath = location.pathname;
+        if (cameFromStory && location.pathname === '/') {
+          // Instagram backed out of a story with history navigation.
+          var order = [];
+          try { order = JSON.parse(sessionStorage.getItem(STORY_ORDER_KEY) || '[]'); } catch (e) {}
+          var index = order.indexOf(cameFromStory);
+          if (index !== -1) {
+            window.location.replace(index + 1 < order.length ? '/stories/' + order[index + 1] + '/' : (flags.homePath || '/?variant=following'));
+            return;
+          }
+        }
         if (isBlockedPath(location.pathname)) {
           history.back();
         }
@@ -1053,7 +1097,30 @@ enum ContentFilterScript {
           var seen = item.seen && item.latest_reel_media && item.seen >= item.latest_reel_media;
           tray.appendChild(makeItem({ href: '/stories/' + user.username + '/', pic: user.profile_pic_url, ring: seen ? seenRing : unseenRing, label: user.username }));
         });
+
+        // Order for chaining one person's story into the next (bootstrap
+        // reads this when Instagram exits a story).
+        try {
+          sessionStorage.setItem('insta-no-reels-story-order', JSON.stringify(rest.map(function (item) { return item.user.username; })));
+        } catch (e) {}
         return tray;
+      }
+
+      // A direct /stories/<user>/ load shows a confirmation ("View story" /
+      // "view as @you") before playing. Confirm it automatically, once per
+      // page, so the story just starts.
+      var storyViewConfirmedFor = '';
+      function autoConfirmStory() {
+        if (!inStories() || storyViewConfirmedFor === location.pathname) return;
+        var controls = document.querySelectorAll('button, [role="button"], a');
+        for (var i = 0; i < controls.length; i++) {
+          var text = (controls[i].textContent || '').trim();
+          if (/^view( story| as)/i.test(text)) {
+            storyViewConfirmedFor = location.pathname;
+            controls[i].click();
+            return;
+          }
+        }
       }
 
       function loadStoriesTray() {
@@ -1283,6 +1350,7 @@ enum ContentFilterScript {
           styleHeader();
           sweepRankedHome();
           hookStoryClose();
+          autoConfirmStory();
           sweepStoriesTray();
           sweepInboxNotes();
           reportUsername();
@@ -1312,6 +1380,7 @@ enum ContentFilterScript {
           sweepStoryAds();
           activateSearch();
           sweepRankedHome();
+          autoConfirmStory();
         }, STORY_SKIP_INTERVAL);
       }
 
