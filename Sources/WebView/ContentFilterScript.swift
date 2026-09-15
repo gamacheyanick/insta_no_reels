@@ -265,8 +265,15 @@ enum ContentFilterScript {
         return ((el && (el.innerText || el.textContent)) || '').trim();
       }
 
+      // The story tray must never be collateral damage of any hiding rule,
+      // whatever wrapper Instagram happens to put it in.
+      function containsStories(el) {
+        return !!(el && el.querySelector && el.querySelector('a[href^="/stories/"]'));
+      }
+
       function hide(el) {
-        if (el && el.style) el.style.setProperty('display', 'none', 'important');
+        if (!el || !el.style || containsStories(el)) return;
+        el.style.setProperty('display', 'none', 'important');
       }
 
       function ancestor(el, hops) {
@@ -558,11 +565,10 @@ enum ContentFilterScript {
             event.preventDefault();
             event.stopPropagation();
             event.stopImmediatePropagation();
-            if (onFollowingFeed()) {
-              window.scrollTo({ top: 0, behavior: 'smooth' });
-            } else {
-              window.location.assign(HOME_PATH);
-            }
+            // Always a real load: after an in-app navigation the URL can
+            // say "following" while Instagram is actually rendering the
+            // ranked feed, so the URL alone can't be trusted.
+            window.location.assign(HOME_PATH);
           }, true);
         }
 
@@ -740,6 +746,10 @@ enum ContentFilterScript {
           var username = json && json.user && json.user.username;
           if (username) {
             postNative({ type: 'username', value: username });
+            ownProfile = { username: username, pic: json.user.profile_pic_url || '' };
+            // Rebuild the story row so "Your story" leads it.
+            storiesTrayFetchedAt = 0;
+            scheduleSweep();
           } else {
             usernameReported = false;
             usernameRetryAt = Date.now() + 60 * 1000;
@@ -924,38 +934,95 @@ enum ContentFilterScript {
       var storiesTrayLoading = false;
       var storiesTrayRetryAt = 0;
 
+      // Sized to match Instagram's own tray on the ranked feed: 76px rings
+      // (2px ring, 3px gap, 66px avatar), ~101px between item centres,
+      // 13px labels, 14px above / 12px below, first avatar 20px in.
+      var ownProfile = null; // { username, pic } once the user-info lookup completes
+
+      function isDarkTheme() {
+        var match = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(getComputedStyle(document.body).backgroundColor || '');
+        if (!match) return true;
+        return (0.299 * match[1] + 0.587 * match[2] + 0.114 * match[3]) < 128;
+      }
+
       function buildStoriesTray(items) {
-        var pageBackground = getComputedStyle(document.body).backgroundColor || '#000';
+        var dark = isDarkTheme();
+        var pageBackground = getComputedStyle(document.body).backgroundColor || (dark ? '#000' : '#fff');
+        var seenRing = dark ? '#3f3f3f' : '#dbdbdb';
+        var unseenRing = 'linear-gradient(45deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888)';
+
         var tray = document.createElement('div');
         tray.setAttribute(STORIES_TRAY_MARK, 'true');
-        tray.style.cssText = 'display:flex;gap:14px;overflow-x:auto;padding:12px 16px 8px;-webkit-overflow-scrolling:touch;scrollbar-width:none;';
+        tray.style.cssText = 'display:flex;gap:23px;overflow-x:auto;padding:14px 20px 12px;-webkit-overflow-scrolling:touch;scrollbar-width:none;';
 
+        function makeItem(options) {
+          var link = document.createElement('a');
+          link.href = options.href;
+          link.style.cssText = 'flex:0 0 auto;width:78px;text-align:center;text-decoration:none;color:inherit;';
+
+          var ring = document.createElement('div');
+          ring.style.cssText = 'position:relative;width:76px;height:76px;margin:0 auto;border-radius:50%;padding:2px;box-sizing:border-box;background:' + options.ring + ';';
+
+          var avatar = document.createElement('img');
+          avatar.src = options.pic || '';
+          avatar.alt = '';
+          avatar.style.cssText = 'width:100%;height:100%;border-radius:50%;border:3px solid ' + pageBackground + ';box-sizing:border-box;object-fit:cover;display:block;';
+          ring.appendChild(avatar);
+
+          if (options.plusBadge) {
+            var badge = document.createElement('div');
+            badge.textContent = '+';
+            badge.style.cssText = 'position:absolute;right:-1px;bottom:-1px;width:22px;height:22px;border-radius:50%;box-sizing:border-box;' +
+              'background:' + (dark ? '#fff' : '#0095f6') + ';color:' + (dark ? '#000' : '#fff') + ';border:2px solid ' + pageBackground + ';' +
+              'font-size:18px;line-height:18px;font-weight:600;text-align:center;';
+            ring.appendChild(badge);
+          }
+
+          var name = document.createElement('div');
+          name.textContent = options.label;
+          name.style.cssText = 'font-size:13px;margin-top:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:' + (options.muted ? '0.6' : '0.9') + ';';
+
+          link.appendChild(ring);
+          link.appendChild(name);
+          if (options.onClick) {
+            link.addEventListener('click', function (event) {
+              event.preventDefault();
+              options.onClick();
+            });
+          }
+          return link;
+        }
+
+        var rest = [];
+        var own = null;
         items.forEach(function (item) {
           var user = item && item.user;
           if (!user || !user.username) return;
+          if (ownProfile && user.username === ownProfile.username) own = item;
+          else rest.push(item);
+        });
+
+        // "Your story" first: the user's own story if they have one, else
+        // a + badge that opens Instagram's create flow (the header's +).
+        if (ownProfile) {
+          if (own) {
+            tray.appendChild(makeItem({ href: '/stories/' + ownProfile.username + '/', pic: ownProfile.pic, ring: seenRing, label: 'Your story', muted: true }));
+          } else {
+            tray.appendChild(makeItem({
+              href: '#', pic: ownProfile.pic, ring: 'transparent', label: 'Your story', muted: true, plusBadge: true,
+              onClick: function () {
+                var create = document.querySelector('header svg[aria-label="New post"], header svg[aria-label="Create"]');
+                var button = create ? clickableFor(create) : null;
+                if (button) button.click();
+              }
+            }));
+          }
+        }
+
+        rest.forEach(function (item) {
+          var user = item.user;
           var seen = item.seen && item.latest_reel_media && item.seen >= item.latest_reel_media;
-
-          var link = document.createElement('a');
-          link.href = '/stories/' + user.username + '/';
-          link.style.cssText = 'flex:0 0 auto;width:72px;text-align:center;text-decoration:none;color:inherit;';
-
-          var ring = document.createElement('div');
-          ring.style.cssText = 'width:66px;height:66px;margin:0 auto;border-radius:50%;padding:2px;box-sizing:border-box;background:' +
-            (seen ? '#5a5a5a' : 'linear-gradient(45deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888)') + ';';
-
-          var avatar = document.createElement('img');
-          avatar.src = user.profile_pic_url || '';
-          avatar.alt = '';
-          avatar.style.cssText = 'width:100%;height:100%;border-radius:50%;border:2px solid ' + pageBackground + ';box-sizing:border-box;object-fit:cover;display:block;';
-
-          var name = document.createElement('div');
-          name.textContent = user.username;
-          name.style.cssText = 'font-size:12px;margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:0.85;';
-
-          ring.appendChild(avatar);
-          link.appendChild(ring);
-          link.appendChild(name);
-          tray.appendChild(link);
+          tray.appendChild(makeItem({ href: '/stories/' + user.username + '/', pic: user.profile_pic_url, ring: seen ? seenRing : unseenRing, label: user.username }));
         });
         return tray;
       }
@@ -985,8 +1052,21 @@ enum ContentFilterScript {
         });
       }
 
+      function instagramTrayPresent() {
+        var links = document.querySelectorAll('a[href^="/stories/"]');
+        for (var i = 0; i < links.length; i++) {
+          if (!links[i].closest('[' + STORIES_TRAY_MARK + ']')) return true;
+        }
+        return false;
+      }
+
       function sweepStoriesTray() {
         if (!onFollowingFeed()) return;
+        // Only stand in when Instagram's own tray isn't on the page.
+        if (instagramTrayPresent()) {
+          if (storiesTray && storiesTray.isConnected) storiesTray.remove();
+          return;
+        }
         loadStoriesTray();
         if (!storiesTray || storiesTray.isConnected || !storiesTray.childElementCount) return;
         // Place it right above the first post, which is guaranteed to be
@@ -997,6 +1077,77 @@ enum ContentFilterScript {
         if (firstPost && firstPost.parentElement) {
           firstPost.parentElement.insertBefore(storiesTray, firstPost);
         }
+      }
+
+      // ---- Messages: the Notes row --------------------------------
+      // Instagram keeps the row of notes pinned above the conversation
+      // list. Two cases: it's `sticky` (put it back in the flow so it
+      // scrolls away), or the list scrolls in its own container beneath
+      // it (collapse the row once the list has been scrolled, restore it
+      // at the top).
+      var inboxNotes = null;
+      var inboxNotesMode = '';
+      var inboxNotesHeight = 0;
+      var inboxNotesCollapsed = false;
+
+      function inInbox() {
+        return location.pathname.indexOf('/direct/') === 0;
+      }
+
+      // The full-width, horizontally scrolling row that holds "Your note".
+      function findInboxNotes() {
+        var label = labelledElements(['Your note'], document.body)[0];
+        if (!label) return null;
+        var node = label;
+        for (var i = 0; i < 10 && node.parentElement && node.parentElement !== document.body; i++) {
+          var rect = node.getBoundingClientRect();
+          if (rect.width >= window.innerWidth * 0.9 && rect.height > 0 && rect.height <= 320) return node;
+          node = node.parentElement;
+        }
+        return null;
+      }
+
+      function sweepInboxNotes() {
+        if (!inInbox()) {
+          inboxNotes = null;
+          return;
+        }
+        if (inboxNotes && inboxNotes.isConnected) return;
+        var notes = findInboxNotes();
+        if (!notes) return;
+        inboxNotes = notes;
+        inboxNotesHeight = notes.getBoundingClientRect().height;
+        inboxNotesCollapsed = false;
+
+        var node = notes;
+        for (var i = 0; i < 6 && node && node !== document.body; i++) {
+          if (getComputedStyle(node).position === 'sticky' && node.getBoundingClientRect().height <= 320) {
+            node.style.setProperty('position', 'relative', 'important');
+            inboxNotesMode = 'flow';
+            return;
+          }
+          node = node.parentElement;
+        }
+
+        inboxNotesMode = 'collapse';
+        notes.style.setProperty('max-height', (inboxNotesHeight + 40) + 'px', 'important');
+        notes.style.setProperty('transition', 'max-height 0.2s ease, opacity 0.2s ease', 'important');
+      }
+
+      function setInboxNotesCollapsed(collapsed) {
+        if (!inboxNotes || inboxNotesMode !== 'collapse' || collapsed === inboxNotesCollapsed) return;
+        inboxNotesCollapsed = collapsed;
+        inboxNotes.style.setProperty('max-height', collapsed ? '0px' : (inboxNotesHeight + 40) + 'px', 'important');
+        inboxNotes.style.setProperty('opacity', collapsed ? '0' : '1', 'important');
+      }
+
+      function onInboxScroll(event) {
+        if (!inInbox() || !inboxNotes) return;
+        var target = event.target;
+        var scroller = (target && target !== document && target.scrollTop !== undefined) ? target : null;
+        if (scroller && scroller.contains(inboxNotes)) return; // already scrolls with the list
+        var y = scroller ? scroller.scrollTop : (window.scrollY || 0);
+        setInboxNotesCollapsed(y > 24);
       }
 
       var sweepQueued = false;
@@ -1018,6 +1169,7 @@ enum ContentFilterScript {
           sweepAppBanners();
           styleHeader();
           sweepStoriesTray();
+          sweepInboxNotes();
           reportUsername();
           sweepPostCounter();
           applyViewport();
@@ -1036,6 +1188,7 @@ enum ContentFilterScript {
         // posts into view for the counter. Capture phase so inner
         // scrollers are covered too.
         document.addEventListener('scroll', schedulePostCounter, { capture: true, passive: true });
+        document.addEventListener('scroll', onInboxScroll, { capture: true, passive: true });
         // A playing story ad doesn't necessarily mutate the DOM, so poll
         // for it too (cheap: returns immediately outside the story viewer).
         // Same for the search page, whose focus state may need a nudge
