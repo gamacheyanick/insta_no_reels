@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @EnvironmentObject private var deepLinks: DeepLinkRouter
 
     @StateObject private var state = WebViewState()
     @StateObject private var accounts = AccountStore()
@@ -23,9 +24,15 @@ struct ContentView: View {
                 //
                 // Keyed on the account id so switching accounts rebuilds
                 // the web view on that account's own data store.
-                InstagramWebView(state: state, account: accounts.current, accountStore: accounts, usage: usage)
-                    .id(accounts.current.id)
-                    .ignoresSafeArea(edges: .bottom)
+                InstagramWebView(
+                    state: state,
+                    account: accounts.current,
+                    accountStore: accounts,
+                    usage: usage,
+                    deepLinks: deepLinks
+                )
+                .id(accounts.current.id)
+                .ignoresSafeArea(edges: .bottom)
             }
 
             // Covers the blank/white page while instagram.com does its
@@ -37,9 +44,15 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.3), value: state.hasLoadedOnce)
-        .onAppear { usage.setActive(scenePhase == .active) }
+        .onAppear { handleScenePhase(scenePhase) }
         .onChange(of: scenePhase) { _, phase in
-            usage.setActive(phase == .active)
+            handleScenePhase(phase)
+        }
+        .onChange(of: accounts.currentID) { _, accountID in
+            // DM checks follow the account that's on screen.
+            if scenePhase == .active {
+                InboxChecker.shared.startForegroundPolling(accountID: accountID)
+            }
         }
         .confirmationDialog("Switch account", isPresented: $accounts.isPickerPresented, titleVisibility: .visible) {
             ForEach(accounts.accounts) { account in
@@ -61,6 +74,19 @@ struct ContentView: View {
             }
 
             Button("Cancel", role: .cancel) {}
+        }
+    }
+
+    private func handleScenePhase(_ phase: ScenePhase) {
+        usage.setActive(phase == .active)
+        switch phase {
+        case .active:
+            InboxChecker.shared.startForegroundPolling(accountID: accounts.currentID)
+        case .background:
+            InboxChecker.shared.stopForegroundPolling()
+            AppDelegate.scheduleInboxRefresh()
+        default:
+            InboxChecker.shared.stopForegroundPolling()
         }
     }
 

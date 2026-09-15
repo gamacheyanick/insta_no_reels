@@ -33,6 +33,12 @@ enum AppConfig {
     /// pinned at the top. Set to false to keep Instagram's sticky header.
     static let headerScrollsAway = true
 
+    /// DM notifications: how often to ask iOS for a background inbox check
+    /// (iOS treats this as "no sooner than" and picks the actual time), and
+    /// how often to check while the app is open.
+    static let inboxBackgroundInterval: TimeInterval = 60 * 60
+    static let inboxForegroundInterval: TimeInterval = 30
+
     /// Instagram's "Following" feed: chronological, only accounts you
     /// follow, no ranking and no recommendations. Used as the home feed
     /// everywhere (launch, Home tab, any navigation to "/").

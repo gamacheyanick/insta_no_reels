@@ -22,6 +22,7 @@ struct InstagramWebView: UIViewRepresentable {
     let account: Account
     let accountStore: AccountStore
     let usage: UsageTracker
+    @ObservedObject var deepLinks: DeepLinkRouter
 
     /// Name of the `window.webkit.messageHandlers.*` bridge the injected
     /// script posts to.
@@ -59,11 +60,22 @@ struct InstagramWebView: UIViewRepresentable {
         webView.scrollView.refreshControl = refreshControl
 
         context.coordinator.webView = webView
+        // Foreground DM checks stay quiet while Messages is on screen.
+        InboxChecker.shared.isViewingMessages = { [weak webView] in
+            webView?.url?.path.hasPrefix("/direct") ?? false
+        }
         webView.load(URLRequest(url: AppConfig.startURL))
         return webView
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        // A tapped DM notification: go to that thread, then clear the
+        // request (outside the view update).
+        if let url = deepLinks.pendingURL {
+            uiView.load(URLRequest(url: url))
+            DispatchQueue.main.async { deepLinks.pendingURL = nil }
+        }
+    }
 
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
         // The content controller holds the handler strongly; break the
@@ -134,6 +146,11 @@ struct InstagramWebView: UIViewRepresentable {
             if !state.hasLoadedOnce {
                 state.hasLoadedOnce = true
             }
+            // Keep the session snapshot fresh for background DM checks.
+            SessionCookieStore.capture(
+                from: webView.configuration.websiteDataStore.httpCookieStore,
+                accountID: account.id
+            )
         }
 
         // WebKit re-enables the pinch gesture on every navigation, so this

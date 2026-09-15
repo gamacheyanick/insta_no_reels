@@ -52,6 +52,18 @@ the foreground this session and how many feed posts have scrolled past
 and it gains an exclamation mark for every further 15. Being in the
 background for 30+ minutes starts a fresh session.
 
+**DM notifications.** While the app is open it snapshots your Instagram
+session, and uses it to check the DM inbox: every 30s in the foreground
+(quiet while you're already in Messages), and in the background whenever
+iOS grants a refresh — requested hourly, but iOS decides the actual timing
+based on usage, so a message can arrive late. Each new incoming message
+posts a local notification, "@username: message text" (media shows as
+"sent a photo" / "sent a reel" / etc.), and tapping it opens that thread.
+The app badge shows the unread count. Only the account currently on
+screen is polled. Real-time push isn't possible here (WKWebView has no Web
+Push, and Apple push needs a paid developer account plus a server), so for
+instant alerts keep the official app installed alongside.
+
 It also smooths over the usual web-view tells so it feels like a native
 app: a proper icon and launch screen, a native splash while the first page
 loads, pull-to-refresh with haptics, and no pinch-zoom, text-selection

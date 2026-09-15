@@ -26,6 +26,10 @@ targets:
         NSMicrophoneUsageDescription: "Needed to record audio for videos and stories."
         NSPhotoLibraryUsageDescription: "Needed to choose photos and videos to post."
         NSPhotoLibraryAddUsageDescription: "Needed to save photos and videos to your library."
+        UIBackgroundModes:
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.personal.instanoreels.inboxcheck
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.personal.instanoreels

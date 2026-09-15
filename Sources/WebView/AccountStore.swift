@@ -59,6 +59,12 @@ final class AccountStore: ObservableObject {
         accounts.first { $0.id == currentID } ?? accounts[0]
     }
 
+    /// The current account id as last saved — readable without an
+    /// instance, for background work that runs outside the UI.
+    static var persistedCurrentID: String {
+        UserDefaults.standard.string(forKey: "currentAccountID") ?? "default"
+    }
+
     func displayName(for account: Account) -> String {
         if let username = account.username {
             return "@\(username)"
@@ -88,6 +94,7 @@ final class AccountStore: ObservableObject {
         currentID = accounts[0].id
         save()
 
+        SessionCookieStore.remove(accountID: removed.id)
         if let storeID = removed.storeID {
             WKWebsiteDataStore.remove(forIdentifier: storeID) { _ in }
         }
