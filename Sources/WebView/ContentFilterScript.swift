@@ -88,6 +88,35 @@ enum ContentFilterScript {
       guardHistoryMethod('pushState');
       guardHistoryMethod('replaceState');
 
+      // Hide the Reels tab from the very first paint. The cleanup script
+      // also injects this, but only once the DOM is ready — that gap was
+      // enough to see (and tap) the tab.
+      function injectEarlyStyle() {
+        var root = document.head || document.documentElement;
+        if (!root) {
+          setTimeout(injectEarlyStyle, 0);
+          return;
+        }
+        var style = document.createElement('style');
+        style.setAttribute('data-insta-no-reels-early', 'true');
+        style.textContent = 'a[href="/reels/"], a[href^="/reels/?"], [aria-label="Reels"] { display: none !important; }';
+        root.appendChild(style);
+      }
+      injectEarlyStyle();
+
+      // Blocking the URL update isn't enough on its own: Instagram's
+      // router switches to the Reels view before it calls pushState. So
+      // the tap itself is swallowed, in the capture phase, before any of
+      // Instagram's handlers run.
+      document.addEventListener('click', function (event) {
+        var target = event.target;
+        if (!target || !target.closest) return;
+        if (!target.closest('a[href^="/reels"], [aria-label="Reels"]')) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+      }, true);
+
       window.addEventListener('popstate', function () {
         if (isBlockedPath(location.pathname)) {
           history.back();
@@ -1130,15 +1159,30 @@ enum ContentFilterScript {
         }
 
         inboxNotesMode = 'collapse';
-        notes.style.setProperty('max-height', (inboxNotesHeight + 40) + 'px', 'important');
-        notes.style.setProperty('transition', 'max-height 0.2s ease, opacity 0.2s ease', 'important');
+        // Collapse the tight wrapper around the row rather than the row
+        // itself: the left/right scroll arrows are overlaid siblings
+        // inside it, and they'd otherwise stay behind. Stops before any
+        // wrapper that also holds the search box or grows beyond the row.
+        var block = notes;
+        while (block.parentElement && !isPageChrome(block.parentElement) &&
+               !block.parentElement.querySelector('input') &&
+               block.parentElement.getBoundingClientRect().height <= inboxNotesHeight + 40) {
+          block = block.parentElement;
+        }
+        inboxNotesBlock = block;
+        block.style.setProperty('max-height', (inboxNotesHeight + 40) + 'px', 'important');
+        block.style.setProperty('transition', 'max-height 0.2s ease, opacity 0.2s ease', 'important');
       }
 
+      var inboxNotesBlock = null;
       function setInboxNotesCollapsed(collapsed) {
-        if (!inboxNotes || inboxNotesMode !== 'collapse' || collapsed === inboxNotesCollapsed) return;
+        if (!inboxNotesBlock || inboxNotesMode !== 'collapse' || collapsed === inboxNotesCollapsed) return;
         inboxNotesCollapsed = collapsed;
-        inboxNotes.style.setProperty('max-height', collapsed ? '0px' : (inboxNotesHeight + 40) + 'px', 'important');
-        inboxNotes.style.setProperty('opacity', collapsed ? '0' : '1', 'important');
+        inboxNotesBlock.style.setProperty('max-height', collapsed ? '0px' : (inboxNotesHeight + 40) + 'px', 'important');
+        inboxNotesBlock.style.setProperty('opacity', collapsed ? '0' : '1', 'important');
+        // Invisible arrows must not stay tappable.
+        inboxNotesBlock.style.setProperty('visibility', collapsed ? 'hidden' : 'visible', 'important');
+        inboxNotesBlock.style.setProperty('pointer-events', collapsed ? 'none' : 'auto', 'important');
       }
 
       function onInboxScroll(event) {
@@ -1148,6 +1192,75 @@ enum ContentFilterScript {
         if (scroller && scroller.contains(inboxNotes)) return; // already scrolls with the list
         var y = scroller ? scroller.scrollTop : (window.scrollY || 0);
         setInboxNotesCollapsed(y > 24);
+      }
+
+      // ---- Never show the ranked home ------------------------------
+      // Instagram's router can land on the ranked feed through in-app
+      // navigation (e.g. the story viewer's X) without a real page load,
+      // leaving the URL claiming "following" while the ranked page is
+      // rendered. Instagram only renders its own story tray on that page,
+      // so its presence at "/" is the tell — reload the Following feed.
+      var RANKED_REDIRECT_KEY = 'insta-no-reels-ranked-redirects';
+      function rankedRedirectAllowed() {
+        var now = Date.now();
+        var recent = [];
+        try { recent = JSON.parse(sessionStorage.getItem(RANKED_REDIRECT_KEY) || '[]'); } catch (e) {}
+        recent = recent.filter(function (t) { return now - t < 15000; });
+        if (recent.length >= 2) return false; // something's looping; give up quietly
+        recent.push(now);
+        try { sessionStorage.setItem(RANKED_REDIRECT_KEY, JSON.stringify(recent)); } catch (e) {}
+        return true;
+      }
+
+      // Only fires on the *settled* ranked page: never during the first
+      // seconds of a load (Instagram can briefly render the ranked layout
+      // while the Following page hydrates, and a reload there would just
+      // stack page loads), never while the header carries the Following
+      // title, and only after the tray has been present on two checks at
+      // least a second apart.
+      var rankedRedirecting = false;
+      var rankedTraySeenAt = 0;
+      function followingTitlePresent() {
+        var headers = document.querySelectorAll('header');
+        for (var i = 0; i < headers.length; i++) {
+          if (labelledElements(['Following'], headers[i]).length) return true;
+        }
+        return false;
+      }
+      function sweepRankedHome() {
+        if (rankedRedirecting || location.pathname !== '/' || inStories()) return;
+        if (performance.now() < 4000) return;
+        if (!instagramTrayPresent() || followingTitlePresent()) {
+          rankedTraySeenAt = 0;
+          return;
+        }
+        var now = Date.now();
+        if (!rankedTraySeenAt) {
+          rankedTraySeenAt = now;
+          return;
+        }
+        if (now - rankedTraySeenAt < 1000) return;
+        if (!rankedRedirectAllowed()) return;
+        rankedRedirecting = true;
+        window.location.replace(HOME_PATH);
+      }
+
+      // The story viewer's X: when the story was opened from the app's
+      // story row (a real navigation to /stories/...), closing it should
+      // return to the Following feed, not Instagram's ranked home.
+      function hookStoryClose() {
+        if (!inStories()) return;
+        document.querySelectorAll('svg[aria-label="Close"]').forEach(function (svg) {
+          var button = clickableFor(svg);
+          if (!button || button.getAttribute('data-insta-no-reels-close')) return;
+          button.setAttribute('data-insta-no-reels-close', 'true');
+          button.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+            window.location.assign(HOME_PATH);
+          }, true);
+        });
       }
 
       var sweepQueued = false;
@@ -1168,6 +1281,8 @@ enum ContentFilterScript {
           hookSearchCancel();
           sweepAppBanners();
           styleHeader();
+          sweepRankedHome();
+          hookStoryClose();
           sweepStoriesTray();
           sweepInboxNotes();
           reportUsername();
@@ -1196,6 +1311,7 @@ enum ContentFilterScript {
         setInterval(function () {
           sweepStoryAds();
           activateSearch();
+          sweepRankedHome();
         }, STORY_SKIP_INTERVAL);
       }
 
