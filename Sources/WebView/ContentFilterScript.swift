@@ -17,6 +17,8 @@ enum ContentFilterScript {
         """
         window.__instaNoReelsFlags = {
           hideReelsInsideFeed: \(AppConfig.hideReelsInsideFeed),
+          autoSkipStoryAds: \(AppConfig.autoSkipStoryAds),
+          homePath: "\(AppConfig.homePath)",
           layout: "\(AppConfig.userAgentMode == .mobile ? "mobile" : "desktop")"
         };
         """
@@ -65,8 +67,12 @@ enum ContentFilterScript {
           var args = Array.prototype.slice.call(arguments);
           try {
             if (url) {
-              var path = new URL(url, location.href).pathname;
-              if (flags.layout === 'mobile' && isExploreRoot(path)) {
+              var resolved = new URL(url, location.href);
+              var path = resolved.pathname;
+              if (path === '/' && !resolved.searchParams.has('variant')) {
+                // Ranked home feed is never shown — always the Following feed.
+                args[2] = flags.homePath || '/?variant=following';
+              } else if (flags.layout === 'mobile' && isExploreRoot(path)) {
                 args[2] = SEARCH_PATH;
               } else if (isBlockedPath(path)) {
                 return; // swallow the navigation, stay on the current page
@@ -273,11 +279,16 @@ enum ContentFilterScript {
       // The mobile site labels ads "Ad" (under the username, in both the
       // feed and the story viewer); the desktop site uses "Sponsored".
       var SPONSORED_LABELS = ['Ad', 'Sponsored'];
-      var SUGGESTED_LABELS = [
-        'Suggested for you', 'Suggested posts', 'Suggested Posts',
-        'Suggested reels', 'Suggested Reels', 'Suggested threads'
-      ];
+      // Per-item labels: shown under a username on a single recommended
+      // post, or as the title of an accounts carousel dropped in between
+      // followed posts. Only that item gets hidden.
+      var SUGGESTED_ITEM_LABELS = ['Suggested for you', 'Suggested reels', 'Suggested Reels', 'Suggested threads'];
+      // Section labels: the divider after the last followed post. Every
+      // feed item after it is a recommendation, so they all get hidden.
+      var SUGGESTED_SECTION_LABELS = ['Suggested posts', 'Suggested Posts'];
       var HIDDEN_MARK = 'data-insta-no-reels-hidden';
+      var DIVIDER_MARK = 'data-insta-no-reels-divider';
+      var NOTE_MARK = 'data-insta-no-reels-note';
 
       function markHidden(el) {
         if (!el) return;
@@ -295,30 +306,43 @@ enum ContentFilterScript {
         return Array.prototype.some.call(el.querySelectorAll('img'), isLargeMedia);
       }
 
-      // Given a label ("Sponsored", "Suggested for you") somewhere in a
-      // post's header, find the whole feed item that contains it. Markup
-      // is obfuscated and differs between the mobile and desktop layouts,
-      // so this works structurally: climb until we hit the first ancestor
+      // Every feed post has exactly one Like control, so this is how many
+      // posts an element spans.
+      function likeCount(el) {
+        return el.querySelectorAll('svg[aria-label="Like"], svg[aria-label="Unlike"]').length;
+      }
+
+      function isPageChrome(el) {
+        return el === document.body || el.tagName === 'MAIN' ||
+          el.querySelector('input, nav, [role="navigation"], header') !== null;
+      }
+
+      // Given a label ("Ad", "Suggested for you") somewhere in a post's
+      // header, find the single feed item that contains it. Markup is
+      // obfuscated and differs between the mobile and desktop layouts, so
+      // this works structurally: climb until we hit the first ancestor
       // that also contains the post's media, then keep climbing while the
       // parent still looks like part of the same post (no sibling has its
-      // own media, and it isn't dramatically taller). Stops at <article>
-      // immediately when the layout uses it.
+      // own media, it isn't dramatically taller, and it still spans at
+      // most one Like control). Never returns anything spanning multiple
+      // posts — that's how the whole feed could vanish.
       function feedItemFor(el) {
         var node = el;
         var found = null;
         for (var i = 0; i < 15 && node && node !== document.body; i++) {
-          if (node.tagName === 'ARTICLE') return node;
+          if (node.tagName === 'ARTICLE') return likeCount(node) > 1 ? null : node;
           if (hasMedia(node)) {
             found = node;
             break;
           }
           node = node.parentElement;
         }
-        if (!found) return null;
+        if (!found || likeCount(found) > 1) return null;
 
         for (var j = 0; j < 8; j++) {
           var parent = found.parentElement;
-          if (!parent || parent === document.body || parent.tagName === 'MAIN') break;
+          if (!parent || isPageChrome(parent)) break;
+          if (likeCount(parent) > 1) break;
           var siblingHasMedia = Array.prototype.some.call(parent.children, function (child) {
             return child !== found && hasMedia(child);
           });
@@ -330,8 +354,41 @@ enum ContentFilterScript {
         return found;
       }
 
+      // The top-level feed entry (direct child of the list of posts) that
+      // contains `el`, for things that aren't posts: a "Suggested for you"
+      // accounts carousel, or the "Suggested posts" divider. Climbs while
+      // the parent holds no posts at all; stops before page chrome. Returns
+      // null if it never reaches the post list (e.g. on a profile page),
+      // so nothing page-sized ever gets hidden.
+      function feedEntryFor(el) {
+        var node = el;
+        for (var i = 0; i < 15; i++) {
+          var parent = node.parentElement;
+          if (!parent || isPageChrome(parent)) return null;
+          if (likeCount(parent) > 0) return node;
+          node = parent;
+        }
+        return null;
+      }
+
       function inStories() {
         return location.pathname.indexOf('/stories/') === 0;
+      }
+
+      // The story viewer isn't always at a /stories/ URL (it can open as
+      // an overlay over the feed), so also recognise it structurally: a
+      // dialog, or a fixed-position ancestor covering most of the screen.
+      function isInOverlay(el) {
+        if (el.closest('[role="dialog"]')) return true;
+        var node = el;
+        while (node && node !== document.body) {
+          if (getComputedStyle(node).position === 'fixed' &&
+              node.getBoundingClientRect().height >= window.innerHeight * 0.6) {
+            return true;
+          }
+          node = node.parentElement;
+        }
+        return false;
       }
 
       function labelledElements(labels, root) {
@@ -349,33 +406,62 @@ enum ContentFilterScript {
         return matches;
       }
 
-      // Ads: anything labelled "Sponsored" in its header. Not in the story
-      // viewer — there the "post" containing the label is the whole viewer,
-      // so story ads get skipped instead (sweepStoryAds).
+      // Ads in the feed: anything labelled "Ad" in a post's header. Labels
+      // inside the story viewer are left alone — there the "post" holding
+      // the label is the whole viewer, and story ads are skipped instead.
       function sweepSponsored() {
         if (inStories()) return;
         labelledElements(SPONSORED_LABELS).forEach(function (el) {
+          if (isInOverlay(el)) return;
           var item = feedItemFor(el);
           if (item) markHidden(item);
         });
       }
 
+      // Synthesize a full touch/pointer/mouse tap at a point, since a bare
+      // .click() doesn't register with the story viewer's gesture handling.
+      function tapAt(x, y) {
+        var target = document.elementFromPoint(x, y);
+        if (!target) return false;
+        var pointer = { bubbles: true, cancelable: true, clientX: x, clientY: y, pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0 };
+        var touch = null;
+        try { touch = new Touch({ identifier: 1, target: target, clientX: x, clientY: y }); } catch (e) {}
+        function touchEvent(type, touches) {
+          if (!touch) return;
+          try {
+            target.dispatchEvent(new TouchEvent(type, { bubbles: true, cancelable: true, touches: touches, targetTouches: touches, changedTouches: [touch] }));
+          } catch (e) {}
+        }
+        try { target.dispatchEvent(new PointerEvent('pointerdown', pointer)); } catch (e) {}
+        touchEvent('touchstart', [touch]);
+        try { target.dispatchEvent(new MouseEvent('mousedown', pointer)); } catch (e) {}
+        try { target.dispatchEvent(new PointerEvent('pointerup', pointer)); } catch (e) {}
+        touchEvent('touchend', []);
+        try { target.dispatchEvent(new MouseEvent('mouseup', pointer)); } catch (e) {}
+        try { target.dispatchEvent(new MouseEvent('click', pointer)); } catch (e) {}
+        return true;
+      }
+
       // Story ads can't be blocked (Instagram serves them inline in the
       // story sequence), so the moment one is on screen, advance past it.
-      // This keeps firing every tick while the "Sponsored" label is still
-      // on screen, so multi-segment ads get tapped through segment by
-      // segment. It alternates between the explicit "Next" control and a
-      // tap on the right-hand side of the story, so whichever one the
-      // current layout actually responds to gets tried within a tick.
+      // Keeps firing every tick while the "Ad" label is still on screen,
+      // so multi-segment ads get tapped through segment by segment.
+      // Alternates between the explicit "Next" control and a synthesized
+      // tap on the right-hand side of the story.
       var STORY_SKIP_INTERVAL = 400;
       var lastStorySkip = 0;
       var storySkipAttempts = 0;
       function sweepStoryAds() {
-        if (!inStories()) {
-          storySkipAttempts = 0;
-          return;
+        if (!flags.autoSkipStoryAds) return;
+        var labels = labelledElements(SPONSORED_LABELS, document.body);
+        var storyAd = null;
+        for (var i = 0; i < labels.length; i++) {
+          if (inStories() || isInOverlay(labels[i])) {
+            storyAd = labels[i];
+            break;
+          }
         }
-        if (labelledElements(SPONSORED_LABELS, document.body).length === 0) {
+        if (!storyAd) {
           storySkipAttempts = 0;
           return;
         }
@@ -385,26 +471,57 @@ enum ContentFilterScript {
         storySkipAttempts++;
 
         var next = document.querySelector('button[aria-label="Next"], [role="button"][aria-label="Next"]');
-        var useNextButton = next && storySkipAttempts % 2 === 1;
-        if (useNextButton) {
+        if (next && storySkipAttempts % 2 === 1) {
           next.click();
           return;
         }
-        var target = document.elementFromPoint(window.innerWidth * 0.85, window.innerHeight * 0.5);
-        if (target) {
-          target.click();
-        } else if (next) {
+        if (!tapAt(window.innerWidth * 0.85, window.innerHeight * 0.5) && next) {
           next.click();
         }
       }
 
-      // Recommendations: suggested posts get hidden as whole feed items;
-      // "Suggested for you" account carousels (no big media) fall back to
-      // hiding the labelled block.
+      function insertCaughtUpNote(after) {
+        if (after.nextElementSibling && after.nextElementSibling.hasAttribute(NOTE_MARK)) return;
+        var note = document.createElement('div');
+        note.setAttribute(NOTE_MARK, 'true');
+        note.textContent = "You're all caught up — suggested posts are hidden.";
+        note.style.cssText = 'padding:32px 24px;text-align:center;color:#8e8e8e;font-size:14px;line-height:1.4;';
+        after.parentElement.insertBefore(note, after.nextSibling);
+      }
+
+      // Recommendations. Per-item labels hide just that post/carousel.
+      // The "Suggested posts" divider marks the end of followed content:
+      // it and everything after it get hidden, and a note takes its place
+      // so the feed ending there doesn't look broken.
       function sweepSuggested() {
-        labelledElements(SUGGESTED_LABELS).forEach(function (el) {
-          markHidden(feedItemFor(el) || ancestor(el, 5));
+        if (inStories()) return;
+
+        labelledElements(SUGGESTED_ITEM_LABELS).forEach(function (el) {
+          if (isInOverlay(el)) return;
+          var item = feedItemFor(el);
+          if (!item && location.pathname === '/') item = feedEntryFor(el);
+          if (item) markHidden(item);
         });
+
+        if (location.pathname === '/') {
+          labelledElements(SUGGESTED_SECTION_LABELS).forEach(function (el) {
+            if (isInOverlay(el)) return;
+            var entry = feedEntryFor(el);
+            if (!entry) return;
+            entry.setAttribute(DIVIDER_MARK, 'true');
+            markHidden(entry);
+            insertCaughtUpNote(entry);
+          });
+
+          // Infinite scroll keeps appending after the divider.
+          document.querySelectorAll('[' + DIVIDER_MARK + ']').forEach(function (divider) {
+            var sibling = divider.nextElementSibling;
+            while (sibling) {
+              if (!sibling.hasAttribute(NOTE_MARK) && !sibling.hasAttribute(HIDDEN_MARK)) markHidden(sibling);
+              sibling = sibling.nextElementSibling;
+            }
+          });
+        }
       }
 
       // Reels-format videos served into the home feed. Only on the home
@@ -418,9 +535,16 @@ enum ContentFilterScript {
         });
       }
 
+      var HOME_PATH = flags.homePath || '/?variant=following';
+
       function sweepNavIcons() {
         document.querySelectorAll('a[href="/reels/"], a[href^="/reels/?"], [aria-label="Reels"]').forEach(function (el) {
           hide(ancestor(el, 2));
+        });
+
+        // Home tab (and the wordmark link) go to the Following feed.
+        document.querySelectorAll('a[href="/"]').forEach(function (a) {
+          a.setAttribute('href', HOME_PATH);
         });
 
         document.querySelectorAll('a[href="/explore/"], a[href^="/explore/?"]').forEach(function (el) {
@@ -474,6 +598,28 @@ enum ContentFilterScript {
         });
       }
 
+      // Make the feed header scroll away with the page instead of staying
+      // pinned. Instagram pins either the <header> or a wrapper around it:
+      // fixed → absolute keeps it at the top of the page (and the space
+      // the page reserves for it still lines up); sticky → relative just
+      // leaves it in the flow.
+      function unstickHeader(header) {
+        var node = header;
+        for (var i = 0; i < 4 && node && node !== document.body; i++) {
+          var position = getComputedStyle(node).position;
+          if (position === 'fixed') {
+            node.style.setProperty('position', 'absolute', 'important');
+            node.style.setProperty('top', '0', 'important');
+            return;
+          }
+          if (position === 'sticky') {
+            node.style.setProperty('position', 'relative', 'important');
+            return;
+          }
+          node = node.parentElement;
+        }
+      }
+
       // Rearrange the feed header to: "+" on the left, wordmark centered,
       // notifications on the right. Layout is obfuscated, so this finds the
       // three controls by their accessibility labels / links and pins each
@@ -482,6 +628,14 @@ enum ContentFilterScript {
       // account switcher.
       function styleHeader() {
         var logo = document.querySelector('header svg[aria-label="Instagram"]');
+        if (!logo) {
+          // On the Following feed the header title can be the text
+          // "Following" (with the chevron) instead of the wordmark.
+          var headers = document.querySelectorAll('header');
+          for (var h = 0; h < headers.length && !logo; h++) {
+            logo = labelledElements(['Following', 'Favorites', 'Instagram'], headers[h])[0] || null;
+          }
+        }
         if (!logo) return;
         var header = logo.closest('header');
         var row = childContaining(header, logo);
@@ -492,6 +646,7 @@ enum ContentFilterScript {
 
         var height = Math.max(row.getBoundingClientRect().height, 44);
         row.setAttribute('data-insta-no-reels-header', 'done');
+        unstickHeader(header);
         row.style.setProperty('position', 'relative', 'important');
         row.style.setProperty('min-height', height + 'px', 'important');
 
@@ -614,7 +769,7 @@ enum ContentFilterScript {
           link.click();
           return;
         }
-        window.location.assign('/');
+        window.location.assign(HOME_PATH);
       }
 
       // "Cancel" on the search page normally drops back to the suggestion

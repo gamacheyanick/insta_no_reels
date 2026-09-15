@@ -191,6 +191,19 @@ struct InstagramWebView: UIViewRepresentable {
 
             if host.hasSuffix("instagram.com") {
                 let path = url.path
+
+                // The ranked home feed is never shown: anything landing on
+                // "/" (e.g. Instagram's own post-login redirect) goes to the
+                // Following feed instead.
+                let isRoot = path.isEmpty || path == "/"
+                let hasVariant = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                    .queryItems?.contains { $0.name == "variant" } ?? false
+                if isRoot && !hasVariant {
+                    decisionHandler(.cancel)
+                    webView.load(URLRequest(url: AppConfig.startURL))
+                    return
+                }
+
                 let isSearch = path.hasPrefix("/explore/search")
                 let isExploreRoot = path == "/explore" || path == "/explore/"
                 let isBlocked = !isSearch && blockedPathPrefixes.contains { path == $0 || path.hasPrefix($0 + "/") }

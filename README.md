@@ -9,7 +9,14 @@ stripping out:
   in-app SPA-navigation level, so tapping it or swiping to it does nothing)
 - **Reels-style videos mixed into your main feed** (toggle in `AppConfig.swift`)
 - **Sponsored posts (ads)** in the feed
-- **"Suggested for you" / "Suggested Posts"** in the feed
+- **The ranked home feed itself** — the app's home is Instagram's
+  *Following* feed (`/?variant=following`): chronological, only accounts
+  you follow, no algorithmic ranking. Launch, the Home tab, and any
+  navigation to `/` all land there; the ranked feed is never shown
+- **"Suggested for you" / "Suggested Posts"** — as a fallback, any
+  recommended posts or account carousels that still appear are removed,
+  and a "Suggested posts" section is replaced by a "You're all caught up"
+  note
 - The **Explore page** entirely (also blocked at both levels)
 - **Non-account search results** — search only ever returns accounts, never
   hashtags, places, or Reels

@@ -24,7 +24,16 @@ enum AppConfig {
     /// even when the Reels tab is untouched.
     static let hideReelsInsideFeed = true
 
-    static let startURL = URL(string: "https://www.instagram.com/")!
+    /// Story ads can't be blocked (Instagram serves them inline in the
+    /// story sequence), so the app taps past them the moment one appears.
+    /// Set to false to leave story ads alone.
+    static let autoSkipStoryAds = true
+
+    /// Instagram's "Following" feed: chronological, only accounts you
+    /// follow, no ranking and no recommendations. Used as the home feed
+    /// everywhere (launch, Home tab, any navigation to "/").
+    static let homePath = "/?variant=following"
+    static let startURL = URL(string: "https://www.instagram.com" + homePath)!
 }
 
 enum UserAgentMode {
