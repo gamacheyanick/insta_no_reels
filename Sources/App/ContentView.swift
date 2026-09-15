@@ -82,6 +82,7 @@ private struct UsageBar: View {
                 .monospacedDigit()
             Text("·")
             Text(usage.postsText)
+                .foregroundStyle(usage.isOverPostsThreshold ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
         }
         .font(.subheadline.weight(.semibold))
         .foregroundStyle(.secondary)

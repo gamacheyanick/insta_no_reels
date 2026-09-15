@@ -34,10 +34,16 @@ Instagram's search-focused state (Recent list), its suggestion grid is
 hidden as a fallback, and "Cancel" goes to the home feed, so the grid of
 recommended reels is never reachable.
 
+Instagram doesn't render the story tray on the Following feed, so the app
+builds its own from Instagram's internal tray endpoint (using your
+session) and places it above the first post: gradient ring = unseen,
+grey = seen, tap to open that person's story.
+
 A usage strip above Instagram's header shows how long the app has been in
 the foreground this session and how many feed posts have scrolled past
-(ads and suggested posts don't count). Being in the background for 30+
-minutes starts a fresh session.
+(ads and suggested posts don't count). Past 15 posts the count turns red,
+and it gains an exclamation mark for every further 15. Being in the
+background for 30+ minutes starts a fresh session.
 
 It also smooths over the usual web-view tells so it feels like a native
 app: a proper icon and launch screen, a native splash while the first page

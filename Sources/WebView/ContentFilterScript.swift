@@ -544,9 +544,27 @@ enum ContentFilterScript {
         });
 
         // Home tab (and the wordmark link) go to the Following feed.
+        // Instagram's router ignores the rewritten href and renders the
+        // ranked feed anyway, so the tap itself is intercepted and turned
+        // into a real navigation.
         document.querySelectorAll('a[href="/"]').forEach(function (a) {
           a.setAttribute('href', HOME_PATH);
         });
+        var homeIcon = document.querySelector('svg[aria-label="Home"]');
+        var homeTab = homeIcon ? clickableFor(homeIcon) : null;
+        if (homeTab && !homeTab.getAttribute('data-insta-no-reels-home')) {
+          homeTab.setAttribute('data-insta-no-reels-home', 'true');
+          homeTab.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+            if (onFollowingFeed()) {
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            } else {
+              window.location.assign(HOME_PATH);
+            }
+          }, true);
+        }
 
         document.querySelectorAll('a[href="/explore/"], a[href^="/explore/?"]').forEach(function (el) {
           if (flags.layout === 'mobile') {
@@ -707,25 +725,29 @@ enum ContentFilterScript {
       }
 
       // Tell the native side which account this data store is logged in
-      // as, so the switcher can label it. The bottom nav's profile tab
-      // links to "/<username>/" — the only single-segment link in the nav
-      // that isn't a known route. (Avatar alt text isn't used: the story
-      // tray's avatars carry the same "…'s profile picture" wording.)
-      var NON_PROFILE_ROUTES = ['explore', 'reels', 'direct', 'accounts', 'create', 'stories', 'p', 'reel', 'search', 'notifications', 'settings', 'emails', 'challenge', 'about', 'legal', 'session', 'your_activity'];
-      var lastReportedUsername = '';
+      // as, so the switcher can label it. Instagram's session cookie
+      // carries the user id; its user-info endpoint maps that to the
+      // username. Nothing is read from the page's markup, so it can't
+      // pick up someone else's link by mistake.
+      var usernameReported = false;
+      var usernameRetryAt = 0;
       function reportUsername() {
-        var home = document.querySelector('svg[aria-label="Home"]');
-        if (!home) return;
-        var nav = home.closest('nav, [role="navigation"]') || ancestor(home, 4);
-        var links = nav.querySelectorAll('a[href]');
-        var username = '';
-        for (var i = 0; i < links.length && !username; i++) {
-          var match = /^\/([A-Za-z0-9._]+)\/?(?:[?#].*)?$/.exec(links[i].getAttribute('href') || '');
-          if (match && NON_PROFILE_ROUTES.indexOf(match[1]) === -1) username = match[1];
-        }
-        if (!username || username === lastReportedUsername) return;
-        lastReportedUsername = username;
-        postNative({ type: 'username', value: username });
+        if (usernameReported || Date.now() < usernameRetryAt) return;
+        var match = /(?:^|;\s*)ds_user_id=(\d+)/.exec(document.cookie || '');
+        if (!match) return; // not logged in yet
+        usernameReported = true;
+        igFetch('/api/v1/users/' + match[1] + '/info/').then(function (json) {
+          var username = json && json.user && json.user.username;
+          if (username) {
+            postNative({ type: 'username', value: username });
+          } else {
+            usernameReported = false;
+            usernameRetryAt = Date.now() + 60 * 1000;
+          }
+        }).catch(function () {
+          usernameReported = false;
+          usernameRetryAt = Date.now() + 60 * 1000;
+        });
       }
 
       // On the search page itself, drop hashtag / place / audio results so
@@ -875,6 +897,108 @@ enum ContentFilterScript {
         }, 200);
       }
 
+      // Instagram's web app id, sent by the site itself on its internal
+      // API calls; the endpoints reject requests without it.
+      var IG_APP_ID = '936619743392459';
+      function igFetch(path) {
+        return fetch(path, {
+          credentials: 'include',
+          headers: { 'x-ig-app-id': IG_APP_ID, 'x-requested-with': 'XMLHttpRequest', 'accept': 'application/json' }
+        }).then(function (response) {
+          return response.ok ? response.json() : null;
+        });
+      }
+
+      function onFollowingFeed() {
+        return location.pathname === '/' && /[?&]variant=following/.test(location.search);
+      }
+
+      // Instagram only renders the story tray on the ranked home, not on
+      // the Following feed. So on the Following feed we build our own from
+      // the same internal endpoint the site uses for the tray: a row of
+      // avatars (gradient ring = unseen, grey = seen), each opening that
+      // person's story.
+      var STORIES_TRAY_MARK = 'data-insta-no-reels-tray';
+      var storiesTray = null;
+      var storiesTrayFetchedAt = 0;
+      var storiesTrayLoading = false;
+      var storiesTrayRetryAt = 0;
+
+      function buildStoriesTray(items) {
+        var pageBackground = getComputedStyle(document.body).backgroundColor || '#000';
+        var tray = document.createElement('div');
+        tray.setAttribute(STORIES_TRAY_MARK, 'true');
+        tray.style.cssText = 'display:flex;gap:14px;overflow-x:auto;padding:12px 16px 8px;-webkit-overflow-scrolling:touch;scrollbar-width:none;';
+
+        items.forEach(function (item) {
+          var user = item && item.user;
+          if (!user || !user.username) return;
+          var seen = item.seen && item.latest_reel_media && item.seen >= item.latest_reel_media;
+
+          var link = document.createElement('a');
+          link.href = '/stories/' + user.username + '/';
+          link.style.cssText = 'flex:0 0 auto;width:72px;text-align:center;text-decoration:none;color:inherit;';
+
+          var ring = document.createElement('div');
+          ring.style.cssText = 'width:66px;height:66px;margin:0 auto;border-radius:50%;padding:2px;box-sizing:border-box;background:' +
+            (seen ? '#5a5a5a' : 'linear-gradient(45deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888)') + ';';
+
+          var avatar = document.createElement('img');
+          avatar.src = user.profile_pic_url || '';
+          avatar.alt = '';
+          avatar.style.cssText = 'width:100%;height:100%;border-radius:50%;border:2px solid ' + pageBackground + ';box-sizing:border-box;object-fit:cover;display:block;';
+
+          var name = document.createElement('div');
+          name.textContent = user.username;
+          name.style.cssText = 'font-size:12px;margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:0.85;';
+
+          ring.appendChild(avatar);
+          link.appendChild(ring);
+          link.appendChild(name);
+          tray.appendChild(link);
+        });
+        return tray;
+      }
+
+      function loadStoriesTray() {
+        var now = Date.now();
+        if (storiesTrayLoading || now < storiesTrayRetryAt) return;
+        if (storiesTray && now - storiesTrayFetchedAt < 5 * 60 * 1000) return;
+        storiesTrayLoading = true;
+        igFetch('/api/v1/feed/reels_tray/').then(function (json) {
+          storiesTrayLoading = false;
+          var items = json && Array.isArray(json.tray) ? json.tray : null;
+          if (!items) {
+            storiesTrayRetryAt = Date.now() + 60 * 1000;
+            return;
+          }
+          var fresh = buildStoriesTray(items);
+          if (storiesTray && storiesTray.parentElement) {
+            storiesTray.parentElement.replaceChild(fresh, storiesTray);
+          }
+          storiesTray = fresh;
+          storiesTrayFetchedAt = Date.now();
+          scheduleSweep();
+        }).catch(function () {
+          storiesTrayLoading = false;
+          storiesTrayRetryAt = Date.now() + 60 * 1000;
+        });
+      }
+
+      function sweepStoriesTray() {
+        if (!onFollowingFeed()) return;
+        loadStoriesTray();
+        if (!storiesTray || storiesTray.isConnected || !storiesTray.childElementCount) return;
+        // Place it right above the first post, which is guaranteed to be
+        // in the visible flow below the header.
+        var firstLike = document.querySelector('svg[aria-label="Like"], svg[aria-label="Unlike"]');
+        if (!firstLike) return;
+        var firstPost = feedItemFor(firstLike) || ancestor(firstLike, 6);
+        if (firstPost && firstPost.parentElement) {
+          firstPost.parentElement.insertBefore(storiesTray, firstPost);
+        }
+      }
+
       var sweepQueued = false;
       function scheduleSweep() {
         if (sweepQueued) return;
@@ -893,6 +1017,7 @@ enum ContentFilterScript {
           hookSearchCancel();
           sweepAppBanners();
           styleHeader();
+          sweepStoriesTray();
           reportUsername();
           sweepPostCounter();
           applyViewport();

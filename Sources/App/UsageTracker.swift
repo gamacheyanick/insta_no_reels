@@ -49,8 +49,20 @@ final class UsageTracker: ObservableObject {
         return String(format: "%d:%02d", minutes, seconds)
     }
 
+    /// Past this many posts the counter turns red, and it gains one
+    /// exclamation mark for every further `postsWarningStep` posts.
+    static let postsWarningThreshold = 15
+    static let postsWarningStep = 15
+
+    var isOverPostsThreshold: Bool {
+        postsViewed > Self.postsWarningThreshold
+    }
+
     var postsText: String {
-        postsViewed == 1 ? "1 post" : "\(postsViewed) posts"
+        let base = postsViewed == 1 ? "1 post" : "\(postsViewed) posts"
+        let over = postsViewed - Self.postsWarningThreshold
+        let exclamations = over > 0 ? over / Self.postsWarningStep : 0
+        return base + String(repeating: "!", count: exclamations)
     }
 
     private func refresh() {
