@@ -162,6 +162,12 @@ enum ContentFilterScript {
             return;
           }
         }
+        if (location.pathname === '/') {
+          // History navigation (e.g. back from Messages) lets Instagram's
+          // router render the ranked feed regardless of the query string.
+          window.location.replace(flags.homePath || '/?variant=following');
+          return;
+        }
         if (isBlockedPath(location.pathname)) {
           history.back();
         }
@@ -388,7 +394,12 @@ enum ContentFilterScript {
         video.addEventListener('ended', function () { if (state && !state.paused) next(); });
         video.addEventListener('loadedmetadata', function () { if (state) hideLoading(); });
         video.addEventListener('waiting', function () { if (state) showLoading(); });
-        video.addEventListener('playing', function () { if (state) hideLoading(); });
+        video.addEventListener('playing', function () {
+          if (!state) return;
+          hideLoading();
+          // Re-apply the user's sound preference once playback is going.
+          if (!state.muted && video.muted) video.muted = false;
+        });
       }
 
       function renderMute() {
@@ -536,11 +547,12 @@ enum ContentFilterScript {
           ui.video.muted = state.muted;
           ui.video.src = videoURL;
           showLoading();
-          ui.video.play().catch(function () {
-            // Autoplay with sound refused: fall back to muted.
-            state.muted = true;
+          ui.video.play().catch(function (error) {
+            if (!state || (error && error.name === 'AbortError')) return;
+            // This attempt was refused with sound: play it muted, but keep
+            // the user's preference so the next video tries with sound
+            // again (and this one is unmuted once playing, see below).
             ui.video.muted = true;
-            renderMute();
             ui.video.play().catch(function () {});
           });
         } else {
@@ -1160,6 +1172,39 @@ enum ContentFilterScript {
         update();
       }
 
+      // Instagram's wordmark SVG only exists on pages this app steers away
+      // from (ranked home, login). Cache it whenever it's seen so the
+      // Following feed's header can show it too.
+      var WORDMARK_KEY = 'insta-no-reels-wordmark';
+      function cacheWordmark() {
+        var svg = document.querySelector('svg[aria-label="Instagram"]');
+        if (!svg) return;
+        try {
+          if (!localStorage.getItem(WORDMARK_KEY)) localStorage.setItem(WORDMARK_KEY, svg.outerHTML);
+        } catch (e) {}
+      }
+
+      function wordmarkElement() {
+        var cached = null;
+        try { cached = localStorage.getItem(WORDMARK_KEY); } catch (e) {}
+        if (cached) {
+          try {
+            var parsed = new DOMParser().parseFromString(cached, 'image/svg+xml').documentElement;
+            if (parsed && parsed.tagName === 'svg') {
+              var svg = document.importNode(parsed, true);
+              svg.removeAttribute('width');
+              svg.setAttribute('height', '26');
+              svg.style.cssText = 'display:block;height:26px;width:auto;color:inherit;';
+              return svg;
+            }
+          } catch (e) {}
+        }
+        var text = document.createElement('span');
+        text.textContent = 'Instagram';
+        text.style.cssText = 'font-size:22px;font-weight:600;letter-spacing:-0.3px;line-height:1;white-space:nowrap;';
+        return text;
+      }
+
       // Rearrange the feed header to: "+" on the left, wordmark centered,
       // notifications on the right. Layout is obfuscated, so this finds the
       // three controls by their accessibility labels / links and pins each
@@ -1188,6 +1233,22 @@ enum ContentFilterScript {
         row.style.setProperty('min-height', height + 'px', 'important');
 
         var logoWrap = clickableFor(logo);
+
+        // On the Following feed the title is the text "Following". Show
+        // the Instagram wordmark there instead: the real SVG if it has
+        // been cached from a page that renders it, else a text title.
+        if (logo.tagName !== 'svg') {
+          var title = wordmarkElement();
+          title.setAttribute('data-insta-no-reels-title', 'true');
+          title.style.cssText += ';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);cursor:pointer;';
+          title.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            postNative({ type: 'switchAccounts' });
+          });
+          row.appendChild(title);
+          logoWrap.style.setProperty('visibility', 'hidden', 'important');
+        }
 
         // Identify the row's icons. Labels are matched loosely, and any
         // unlabelled leftovers are taken in DOM order (create comes before
@@ -1637,6 +1698,24 @@ enum ContentFilterScript {
         }
       }
 
+      // The inbox's back arrow would route to the ranked feed; send it
+      // to the Following feed instead. Only on the inbox itself — inside a
+      // thread, back should still return to the inbox.
+      function hookInboxBack() {
+        if (location.pathname !== '/direct/inbox/' && location.pathname !== '/direct/') return;
+        document.querySelectorAll('svg[aria-label="Back"]').forEach(function (svg) {
+          var button = clickableFor(svg);
+          if (!button || button.getAttribute('data-insta-no-reels-inbox-back')) return;
+          button.setAttribute('data-insta-no-reels-inbox-back', 'true');
+          button.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+            window.location.assign(HOME_PATH);
+          }, true);
+        });
+      }
+
       // ---- Messages: the Notes row --------------------------------
       // Instagram keeps the row of notes pinned above the conversation
       // list. Two cases: it's `sticky` (put it back in the flow so it
@@ -1809,7 +1888,9 @@ enum ContentFilterScript {
           activateSearch();
           hookSearchCancel();
           sweepAppBanners();
+          cacheWordmark();
           styleHeader();
+          hookInboxBack();
           sweepRankedHome();
           hookStoryClose();
           autoConfirmStory();
