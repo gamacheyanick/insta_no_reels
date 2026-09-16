@@ -327,6 +327,50 @@ enum ContentFilterScript {
       // Instagram has moved its "story seen" call around over the years.
       // Try each known shape until one is accepted; the row also keeps its
       // own local record, so rings/gating don't depend on this succeeding.
+      function cacheReelData(key, data) {
+        var items = data && Array.isArray(data.items) ? data.items : [];
+        reelCache[key] = Promise.resolve({ reelId: data && data.id ? String(data.id) : key, items: items });
+      }
+
+      function preloadFirst(key) {
+        reelCache[key].then(function (data) { preload(data.items[0]); });
+      }
+
+      // Fetch several people's stories in one call and cache them; the
+      // first image of the first few is warmed too.
+      function prefetch(reels) {
+        var pending = reels.filter(function (reel) { return !reel.items && !reelCache[String(reel.userPk)]; });
+        var chunks = [];
+        for (var i = 0; i < pending.length; i += 10) chunks.push(pending.slice(i, i + 10));
+        chunks.forEach(function (chunk, chunkIndex) {
+          var query = chunk.map(function (reel) { return 'reel_ids=' + encodeURIComponent(String(reel.userPk)); }).join('&');
+          var keys = chunk.map(function (reel) { return String(reel.userPk); });
+          keys.forEach(function (key) { reelCache[key] = null; }); // claimed
+          igFetch('/api/v1/feed/reels_media/?' + query).then(function (json) {
+            var byKey = {};
+            if (json && json.reels) {
+              Object.keys(json.reels).forEach(function (id) { byKey[String(id)] = json.reels[id]; });
+            }
+            if (json && Array.isArray(json.reels_media)) {
+              json.reels_media.forEach(function (data) {
+                var id = data && (data.id || (data.user && data.user.pk));
+                if (id) byKey[String(id)] = data;
+              });
+            }
+            keys.forEach(function (key, i) {
+              if (!byKey[key]) {
+                delete reelCache[key]; // not in this response: fetch individually when tapped
+                return;
+              }
+              cacheReelData(key, byKey[key]);
+              if (chunkIndex === 0 && i < 5) preloadFirst(key);
+            });
+          }).catch(function () {
+            keys.forEach(function (key) { delete reelCache[key]; });
+          });
+        });
+      }
+
       function markSeen(reel, reelId, item) {
         if (!csrfToken() || !item) return;
         var now = Math.floor(Date.now() / 1000);
@@ -740,7 +784,7 @@ enum ContentFilterScript {
         return true;
       }
 
-      window.__instaNoReelsViewer = { open: open, close: closeViewer, isOpen: function () { return !!state; } };
+      window.__instaNoReelsViewer = { open: open, close: closeViewer, prefetch: prefetch, isOpen: function () { return !!state; } };
     })();
     """#
 
@@ -990,7 +1034,7 @@ enum ContentFilterScript {
         var node;
         while ((node = walker.nextNode())) {
           var text = (node.textContent || '').trim();
-          if (!text || text.length > 60) continue;
+          if (!text || text.length > 120) continue;
           (index[text] || (index[text] = [])).push(node.parentElement);
         }
         return index;
@@ -1749,6 +1793,11 @@ enum ContentFilterScript {
           tray.appendChild(link);
         });
 
+        // Warm the viewer's cache so tapping a person plays immediately.
+        if (window.__instaNoReelsViewer && viewerReels.length) {
+          try { window.__instaNoReelsViewer.prefetch(viewerReels); } catch (e) {}
+        }
+
         // Order for the direct-URL fallback chaining in bootstrap.
         try {
           sessionStorage.setItem('insta-no-reels-story-order', JSON.stringify(rest.map(function (item) { return item.user.username; })));
@@ -1894,7 +1943,27 @@ enum ContentFilterScript {
       // thread endpoint still returns them (with media URLs) for this
       // session, so the placeholder becomes a tap target that plays the
       // unseen ones in the story viewer and marks them viewed.
-      var VISUAL_PLACEHOLDER = /use the (instagram )?(mobile )?app|only available (on|in) (the )?(instagram |mobile )?app/i;
+      var VISUAL_PLACEHOLDER = /use the (instagram )?(mobile )?app|only available (on|in) (the )?(instagram |mobile )?app|replayed once|view(ed)? once/i;
+
+      // Catch a tap anywhere on a placeholder bubble, however Instagram
+      // happens to structure it, before its own handlers run.
+      function isVisualPlaceholderTap(target) {
+        var node = target;
+        for (var i = 0; i < 6 && node && node !== document.body; i++) {
+          var text = node.textContent || '';
+          if (text.length < 200 && VISUAL_PLACEHOLDER.test(text)) return true;
+          node = node.parentElement;
+        }
+        return false;
+      }
+      document.addEventListener('click', function (event) {
+        var threadID = threadIDFromPath();
+        if (!threadID || !event.target || !isVisualPlaceholderTap(event.target)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        openVisualMessages(threadID);
+      }, true);
 
       function threadIDFromPath() {
         var match = /^\/direct\/t\/([^\/]+)/.exec(location.pathname);
