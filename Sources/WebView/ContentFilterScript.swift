@@ -290,6 +290,9 @@ enum ContentFilterScript {
       // ---- Data ------------------------------------------------------
       var reelCache = {};
       function loadReel(reel) {
+        if (reel.items) {
+          return Promise.resolve({ reelId: String(reel.userPk), items: reel.items });
+        }
         var key = String(reel.userPk);
         if (reelCache[key]) return reelCache[key];
         reelCache[key] = igFetch('/api/v1/feed/reels_media/?reel_ids=' + encodeURIComponent(key)).then(function (json) {
@@ -618,7 +621,7 @@ enum ContentFilterScript {
         }
         tick();
 
-        markSeen(reel, state.reelId, item);
+        if (!reel.items) markSeen(reel, state.reelId, item);
         if (state.callbacks.onItemSeen) { try { state.callbacks.onItemSeen(reel.username, item.taken_at || 0); } catch (e) {} }
         preload(state.items[state.itemIndex + 1]);
         if (state.itemIndex === state.items.length - 1 && state.reels[state.userIndex + 1]) {
@@ -987,7 +990,7 @@ enum ContentFilterScript {
         var node;
         while ((node = walker.nextNode())) {
           var text = (node.textContent || '').trim();
-          if (!text || text.length > 40) continue;
+          if (!text || text.length > 60) continue;
           (index[text] || (index[text] = [])).push(node.parentElement);
         }
         return index;
@@ -1885,6 +1888,116 @@ enum ContentFilterScript {
         });
       }
 
+      // ---- Messages: disappearing photos / videos ------------------
+      // Instagram's web client refuses to render "view once" / replayable
+      // visual messages and shows a "use the mobile app" placeholder. The
+      // thread endpoint still returns them (with media URLs) for this
+      // session, so the placeholder becomes a tap target that plays the
+      // unseen ones in the story viewer and marks them viewed.
+      var VISUAL_PLACEHOLDER = /use the (instagram )?(mobile )?app|only available (on|in) (the )?(instagram |mobile )?app/i;
+
+      function threadIDFromPath() {
+        var match = /^\/direct\/t\/([^\/]+)/.exec(location.pathname);
+        return match ? match[1] : null;
+      }
+
+      function toast(message) {
+        var note = document.createElement('div');
+        note.textContent = message;
+        note.style.cssText = 'position:fixed;left:50%;bottom:90px;transform:translateX(-50%);max-width:80%;padding:10px 16px;border-radius:12px;background:rgba(0,0,0,.85);color:#fff;font-size:14px;line-height:1.35;text-align:center;z-index:2147483001;';
+        document.body.appendChild(note);
+        setTimeout(function () { note.remove(); }, 2800);
+      }
+
+      function markVisualMessageSeen(threadID, itemID) {
+        var csrf = (/(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '') || [])[1];
+        if (!csrf) return;
+        fetch('/api/v1/direct_v2/visual_threads/' + encodeURIComponent(threadID) + '/item_seen/', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'x-csrftoken': csrf,
+            'x-ig-app-id': IG_APP_ID,
+            'x-asbd-id': '129477',
+            'x-requested-with': 'XMLHttpRequest',
+            'content-type': 'application/x-www-form-urlencoded'
+          },
+          body: new URLSearchParams({ item_ids: JSON.stringify([itemID]), target_item_type: 'raven_media' }).toString()
+        }).catch(function () {});
+      }
+
+      function openVisualMessages(threadID) {
+        igFetch('/api/v1/direct_v2/threads/' + encodeURIComponent(threadID) + '/?visual_message_return_type=unseen&direction=older&limit=20').then(function (json) {
+          var thread = json && json.thread;
+          var items = thread && Array.isArray(thread.items) ? thread.items : [];
+          var users = thread && Array.isArray(thread.users) ? thread.users : [];
+          var media = [];
+          items.forEach(function (item) {
+            var visual = item.visual_media || item.raven_media;
+            var m = visual && visual.media;
+            if (!m || (!m.image_versions2 && !m.video_versions)) return;
+            media.push({
+              pk: m.pk || item.item_id,
+              itemID: item.item_id,
+              senderID: String(item.user_id || ''),
+              media_type: m.media_type || (m.video_versions ? 2 : 1),
+              image_versions2: m.image_versions2,
+              video_versions: m.video_versions,
+              taken_at: item.timestamp ? Math.floor(item.timestamp / 1000000) : 0
+            });
+          });
+          if (!media.length) {
+            toast('Nothing to show — these photos may have expired or already been viewed.');
+            return;
+          }
+          media.sort(function (a, b) { return a.taken_at - b.taken_at; });
+
+          var sender = null;
+          for (var i = 0; i < users.length && !sender; i++) {
+            if (String(users[i].pk || users[i].pk_id || '') === media[0].senderID) sender = users[i];
+          }
+          var viewer = window.__instaNoReelsViewer;
+          if (!viewer) return;
+          var byID = {};
+          media.forEach(function (m) { byID[m.taken_at] = m; });
+          viewer.open([{
+            userPk: 'dm-' + threadID,
+            username: sender ? sender.username : (thread.thread_title || 'Message'),
+            pic: sender ? (sender.profile_pic_url || '') : '',
+            items: media
+          }], 0, {
+            onItemSeen: function (username, takenAt) {
+              var m = byID[takenAt];
+              if (m) markVisualMessageSeen(threadID, m.itemID);
+            }
+          });
+        }).catch(function () {
+          toast("Couldn't load the photo.");
+        });
+      }
+
+      function hookVisualPlaceholders() {
+        var threadID = threadIDFromPath();
+        if (!threadID) return;
+        if (!labelIndex) labelIndex = buildLabelIndex();
+        Object.keys(labelIndex).forEach(function (text) {
+          if (!VISUAL_PLACEHOLDER.test(text)) return;
+          labelIndex[text].forEach(function (el) {
+            if (!el || !el.isConnected || el.getAttribute('data-insta-no-reels-visual')) return;
+            el.setAttribute('data-insta-no-reels-visual', 'true');
+            var target = el.closest('[role="button"], button, a') || el;
+            target.style.setProperty('cursor', 'pointer');
+            target.style.setProperty('text-decoration', 'underline');
+            target.addEventListener('click', function (event) {
+              event.preventDefault();
+              event.stopPropagation();
+              event.stopImmediatePropagation();
+              openVisualMessages(threadID);
+            }, true);
+          });
+        });
+      }
+
       // ---- Messages: the Notes row --------------------------------
       // Instagram keeps the row of notes pinned above the conversation
       // list. Two cases: it's `sticky` (put it back in the flow so it
@@ -2079,6 +2192,7 @@ enum ContentFilterScript {
           autoConfirmStory();
           sweepStoriesTray();
           sweepInboxNotes();
+          hookVisualPlaceholders();
           reportUsername();
           sweepPostCounter();
           applyViewport();

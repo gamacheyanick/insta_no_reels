@@ -52,6 +52,12 @@ the foreground this session and how many feed posts have scrolled past
 and it gains an exclamation mark for every further 15. Being in the
 background for 30+ minutes starts a fresh session.
 
+**Disappearing photos/videos in DMs.** Instagram's web client refuses to
+render "view once" / replayable visual messages ("use the mobile app to
+view"). The app makes that placeholder tappable: it fetches the thread's
+unseen visual messages through Instagram's thread endpoint (your session),
+plays them in the story viewer, and marks them viewed like the real app.
+
 **DM notifications.** While the app is open it snapshots your Instagram
 session, and uses it to check the DM inbox: every 30s in the foreground
 (quiet while you're already in Messages), and in the background whenever
