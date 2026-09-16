@@ -305,27 +305,69 @@ enum ContentFilterScript {
         return reelCache[key];
       }
 
-      function markSeen(reel, reelId, item) {
+      function postForm(path, fields) {
         var csrf = csrfToken();
-        if (!csrf || !item) return;
-        var body = new URLSearchParams({
-          reelMediaId: String(item.pk || ''),
-          reelMediaOwnerId: String(reel.userPk),
-          reelId: String(reelId),
-          reelMediaTakenAt: String(item.taken_at || 0),
-          viewSeenAt: String(Math.floor(Date.now() / 1000))
-        });
-        fetch('/stories/reel/seen', {
+        return fetch(path, {
           method: 'POST',
           credentials: 'include',
           headers: {
             'x-csrftoken': csrf,
             'x-ig-app-id': IG_APP_ID,
+            'x-asbd-id': '129477',
             'x-requested-with': 'XMLHttpRequest',
             'content-type': 'application/x-www-form-urlencoded'
           },
-          body: body.toString()
-        }).catch(function () {});
+          body: new URLSearchParams(fields).toString()
+        }).then(function (response) { return response.ok; }).catch(function () { return false; });
+      }
+
+      // Instagram has moved its "story seen" call around over the years.
+      // Try each known shape until one is accepted; the row also keeps its
+      // own local record, so rings/gating don't depend on this succeeding.
+      function markSeen(reel, reelId, item) {
+        if (!csrfToken() || !item) return;
+        var now = Math.floor(Date.now() / 1000);
+        var mediaPk = String(item.pk || '');
+        var ownerPk = String(reel.userPk);
+        var takenAt = String(item.taken_at || 0);
+
+        var reelsMap = {};
+        reelsMap[mediaPk + '_' + ownerPk] = [takenAt + '_' + now];
+        var attempts = [
+          function () {
+            return postForm('/api/v2/media/seen/?reel=1&live_vod=0', {
+              reels: JSON.stringify(reelsMap),
+              container_module: 'feed_timeline',
+              reel_media_skipped: '{}',
+              live_vods: '{}',
+              live_vods_skipped: '{}',
+              nuxes: '{}',
+              nuxes_skipped: '{}'
+            });
+          },
+          function () {
+            return postForm('/stories/reel/seen', {
+              reelMediaId: mediaPk,
+              reelMediaOwnerId: ownerPk,
+              reelId: String(reelId),
+              reelMediaTakenAt: takenAt,
+              viewSeenAt: String(now)
+            });
+          },
+          function () {
+            return postForm('/api/v1/stories/reel/seen', {
+              reelMediaId: mediaPk,
+              reelMediaOwnerId: ownerPk,
+              reelId: String(reelId),
+              reelMediaTakenAt: takenAt,
+              viewSeenAt: String(now)
+            });
+          }
+        ];
+        (function tryNext(i) {
+          if (i >= attempts.length) return;
+          attempts[i]().then(function (ok) { if (!ok) tryNext(i + 1); });
+        })(0);
       }
 
       // ---- UI --------------------------------------------------------
@@ -577,6 +619,7 @@ enum ContentFilterScript {
         tick();
 
         markSeen(reel, state.reelId, item);
+        if (state.callbacks.onItemSeen) { try { state.callbacks.onItemSeen(reel.username, item.taken_at || 0); } catch (e) {} }
         preload(state.items[state.itemIndex + 1]);
         if (state.itemIndex === state.items.length - 1 && state.reels[state.userIndex + 1]) {
           loadReel(state.reels[state.userIndex + 1]).then(function (data) { preload(data.items[0]); });
@@ -606,9 +649,22 @@ enum ContentFilterScript {
             if (nextIndex < 0 || nextIndex >= state.reels.length) closeViewer(); else showUser(nextIndex, fromEnd);
             return;
           }
+          var startAt = 0;
+          if (!fromEnd && reel.seenBefore) {
+            while (startAt < data.items.length && (data.items[startAt].taken_at || 0) <= reel.seenBefore) startAt++;
+            if (startAt >= data.items.length) {
+              if (index === state.forceIndex) {
+                startAt = 0; // tapped directly: replay from the start
+              } else {
+                var skipTo = index + direction;
+                if (skipTo < 0 || skipTo >= state.reels.length) closeViewer(); else showUser(skipTo, fromEnd);
+                return;
+              }
+            }
+          }
           state.items = data.items;
           state.reelId = data.reelId;
-          state.itemIndex = fromEnd ? data.items.length - 1 : 0;
+          state.itemIndex = fromEnd ? data.items.length - 1 : startAt;
           buildProgress(data.items.length);
           showItem();
         });
@@ -621,7 +677,7 @@ enum ContentFilterScript {
           showItem();
         } else {
           var reel = state.reels[state.userIndex];
-          if (state.onUserSeen) { try { state.onUserSeen(reel.username); } catch (e) {} }
+          if (state.callbacks.onUserSeen) { try { state.callbacks.onUserSeen(reel.username); } catch (e) {} }
           showUser(state.userIndex + 1, false);
         }
       }
@@ -647,15 +703,20 @@ enum ContentFilterScript {
         ui.img.removeAttribute('src');
         ui.root.remove();
         document.documentElement.style.overflow = state.previousOverflow;
+        var callbacks = state.callbacks;
         state = null;
+        if (callbacks.onClose) { try { callbacks.onClose(); } catch (e) {} }
       }
 
-      function open(reels, startIndex, onUserSeen) {
+      // callbacks: { onItemSeen(username, takenAt), onUserSeen(username), onClose() }
+      function open(reels, startIndex, callbacks) {
         if (!reels || !reels.length) return false;
+        if (typeof callbacks === 'function') callbacks = { onUserSeen: callbacks };
         if (!ui) buildUI();
         if (state) closeViewer();
         state = {
           reels: reels,
+          forceIndex: startIndex || 0,
           userIndex: startIndex || 0,
           itemIndex: 0,
           items: [],
@@ -667,7 +728,7 @@ enum ContentFilterScript {
           elapsedBeforePause: 0,
           raf: 0,
           loadToken: 0,
-          onUserSeen: onUserSeen,
+          callbacks: callbacks || {},
           previousOverflow: document.documentElement.style.overflow
         };
         document.documentElement.style.overflow = 'hidden';
@@ -1612,23 +1673,42 @@ enum ContentFilterScript {
           else rest.push(item);
         });
 
+        // Like Instagram's tray, only people with something new are shown.
+        // "Seen" combines Instagram's own record with the app's local one
+        // (kept per person as the newest story timestamp watched), so it
+        // survives a refresh even when Instagram's seen call misbehaves.
+        var localSeen = loadStorySeen();
+        rest = rest.filter(function (item) { return !storySeenUpTo(item, localSeen); });
+
         // Everything the in-app viewer needs, in row order, plus each
         // person's ring so it can be greyed once their story is watched.
         var viewerReels = [];
         var storyRings = {};
         function reelFor(item) {
+          var serverSeen = item.seen || 0;
+          var seenBefore = Math.max(serverSeen, localSeen[item.user.username] || 0);
           return {
             userPk: item.user.pk || item.id,
             username: item.user.username,
             pic: item.user.profile_pic_url || '',
-            seen: !!(item.seen && item.latest_reel_media && item.seen >= item.latest_reel_media)
+            seenBefore: seenBefore,
+            seen: !!(item.latest_reel_media && seenBefore >= item.latest_reel_media)
           };
         }
         function openAt(index, fallbackHref) {
           var viewer = window.__instaNoReelsViewer;
-          var opened = viewer && viewer.open(viewerReels, index, function (username) {
-            var ring = storyRings[username];
-            if (ring) ring.style.background = seenRing;
+          var opened = viewer && viewer.open(viewerReels, index, {
+            onItemSeen: function (username, takenAt) {
+              recordStorySeen(username, takenAt);
+            },
+            onUserSeen: function (username) {
+              var ring = storyRings[username];
+              if (ring) ring.style.background = seenRing;
+            },
+            onClose: function () {
+              // Drop the people that are now fully watched.
+              rebuildStoriesTray();
+            }
           });
           if (!opened) window.location.assign(fallbackHref);
         }
@@ -1690,6 +1770,41 @@ enum ContentFilterScript {
         }
       }
 
+      // Local "seen" record: username -> newest story timestamp watched.
+      var STORY_SEEN_KEY = 'insta-no-reels-story-seen';
+      function loadStorySeen() {
+        try { return JSON.parse(localStorage.getItem(STORY_SEEN_KEY) || '{}') || {}; } catch (e) { return {}; }
+      }
+      function recordStorySeen(username, takenAt) {
+        if (!username || !takenAt) return;
+        var seen = loadStorySeen();
+        if ((seen[username] || 0) >= takenAt) return;
+        seen[username] = takenAt;
+        // Keep it from growing forever: anything older than 2 days can't
+        // correspond to a live story anyway.
+        var cutoff = Math.floor(Date.now() / 1000) - 2 * 24 * 3600;
+        Object.keys(seen).forEach(function (name) { if (seen[name] < cutoff) delete seen[name]; });
+        try { localStorage.setItem(STORY_SEEN_KEY, JSON.stringify(seen)); } catch (e) {}
+      }
+      function storySeenUpTo(item, localSeen) {
+        if (!item.latest_reel_media) return false;
+        var seenBefore = Math.max(item.seen || 0, localSeen[item.user.username] || 0);
+        return seenBefore >= item.latest_reel_media;
+      }
+
+      var lastTrayItems = null;
+      function replaceStoriesTray(fresh) {
+        if (storiesTray && storiesTray.parentElement) {
+          storiesTray.parentElement.replaceChild(fresh, storiesTray);
+        }
+        storiesTray = fresh;
+      }
+      function rebuildStoriesTray() {
+        if (!lastTrayItems) return;
+        replaceStoriesTray(buildStoriesTray(lastTrayItems));
+        scheduleSweep();
+      }
+
       function loadStoriesTray() {
         var now = Date.now();
         if (storiesTrayLoading || now < storiesTrayRetryAt) return;
@@ -1702,11 +1817,8 @@ enum ContentFilterScript {
             storiesTrayRetryAt = Date.now() + 60 * 1000;
             return;
           }
-          var fresh = buildStoriesTray(items);
-          if (storiesTray && storiesTray.parentElement) {
-            storiesTray.parentElement.replaceChild(fresh, storiesTray);
-          }
-          storiesTray = fresh;
+          lastTrayItems = items;
+          replaceStoriesTray(buildStoriesTray(items));
           storiesTrayFetchedAt = Date.now();
           scheduleSweep();
         }).catch(function () {

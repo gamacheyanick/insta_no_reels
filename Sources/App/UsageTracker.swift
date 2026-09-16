@@ -64,9 +64,9 @@ final class UsageTracker: ObservableObject {
         postsViewed / Self.postsWarningStep
     }
 
-    /// Base 15pt, +1.5pt per block, capped so the bar never runs away.
+    /// Base 15pt, +3pt per block, capped so the bar never runs away.
     var postsFontSize: CGFloat {
-        min(15 + CGFloat(postsGrowthLevel) * 1.5, 30)
+        min(15 + CGFloat(postsGrowthLevel) * 3, 36)
     }
 
     var postsText: String {
