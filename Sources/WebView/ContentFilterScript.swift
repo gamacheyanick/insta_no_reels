@@ -198,10 +198,46 @@ enum ContentFilterScript {
         return json;
       }
 
+      // ---- Borrow Instagram's own request headers --------------------
+      // The site stamps every internal API call with a handful of session
+      // headers (www-claim, csrf, rollout hash, ...). Our own calls (story
+      // viewer, chat photos) should carry the same set so they look like
+      // the page's requests rather than a stripped-down client. Remember
+      // the latest value of each as Instagram sends it, plus the claim the
+      // server hands back, and expose them for the other scripts.
+      var CAPTURED_HEADERS = ['x-ig-www-claim', 'x-csrftoken', 'x-instagram-ajax', 'x-asbd-id', 'x-ig-app-id', 'x-web-session-id', 'x-fb-lsd', 'x-bloks-version-id', 'x-ig-d'];
+      var captured = window.__instaNoReelsHeaders = window.__instaNoReelsHeaders || {};
+      function rememberHeader(name, value) {
+        name = String(name || '').toLowerCase();
+        if (CAPTURED_HEADERS.indexOf(name) < 0 || value === undefined || value === null || value === '') return;
+        captured[name] = String(value);
+      }
+      function rememberHeaders(headers) {
+        try {
+          if (!headers) return;
+          if (typeof headers.forEach === 'function' && !Array.isArray(headers)) {
+            headers.forEach(function (value, name) { rememberHeader(name, value); });
+          } else if (Array.isArray(headers)) {
+            headers.forEach(function (pair) { if (pair) rememberHeader(pair[0], pair[1]); });
+          } else if (typeof headers === 'object') {
+            Object.keys(headers).forEach(function (name) { rememberHeader(name, headers[name]); });
+          }
+        } catch (e) {}
+      }
+      function rememberClaim(response) {
+        try {
+          var claim = response && response.headers && response.headers.get('x-ig-set-www-claim');
+          if (claim && claim !== '0') captured['x-ig-www-claim'] = claim;
+        } catch (e) {}
+      }
+
       var originalFetch = window.fetch;
       window.fetch = function (input, init) {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (init && init.headers) rememberHeaders(init.headers);
+        else if (input && typeof input === 'object' && input.headers) rememberHeaders(input.headers);
         return originalFetch.apply(this, arguments).then(function (response) {
+          rememberClaim(response);
           if (!isSearchURL(url)) return response;
           return response
             .clone()
@@ -229,8 +265,18 @@ enum ContentFilterScript {
           requestUrl = url;
           return originalOpen.apply(xhr, arguments);
         };
+        var originalSetHeader = xhr.setRequestHeader;
+        xhr.setRequestHeader = function (name, value) {
+          rememberHeader(name, value);
+          return originalSetHeader.apply(xhr, arguments);
+        };
         xhr.addEventListener('readystatechange', function () {
-          if (xhr.readyState !== 4 || !isSearchURL(requestUrl)) return;
+          if (xhr.readyState !== 4) return;
+          try {
+            var claim = xhr.getResponseHeader('x-ig-set-www-claim');
+            if (claim && claim !== '0') captured['x-ig-www-claim'] = claim;
+          } catch (e) {}
+          if (!isSearchURL(requestUrl)) return;
           try {
             var filtered = JSON.stringify(keepAccountsOnly(JSON.parse(xhr.responseText)));
             Object.defineProperty(xhr, 'responseText', { value: filtered, configurable: true });
@@ -257,16 +303,35 @@ enum ContentFilterScript {
       var HOLD_DELAY = 220;
       var MARK = 'data-insta-no-reels-viewer';
 
-      function igFetch(path) {
-        return fetch(path, {
-          credentials: 'include',
-          headers: { 'x-ig-app-id': IG_APP_ID, 'x-requested-with': 'XMLHttpRequest', 'accept': 'application/json' }
-        }).then(function (response) { return response.ok ? response.json() : null; });
-      }
-
       function csrfToken() {
         var match = /(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '');
         return match ? match[1] : '';
+      }
+
+      // Headers for our own calls to Instagram's internal API. Start from
+      // whatever the page itself has been sending (captured by the
+      // bootstrap script), so the request carries the same session
+      // headers as Instagram's, and fill in the few we know when the
+      // page hasn't made a call yet.
+      function igHeaders(extra) {
+        var captured = window.__instaNoReelsHeaders || {};
+        var headers = {};
+        Object.keys(captured).forEach(function (name) { headers[name] = captured[name]; });
+        if (!headers['x-ig-app-id']) headers['x-ig-app-id'] = IG_APP_ID;
+        if (!headers['x-asbd-id']) headers['x-asbd-id'] = '129477';
+        var csrf = csrfToken();
+        if (csrf) headers['x-csrftoken'] = csrf;
+        headers['x-requested-with'] = 'XMLHttpRequest';
+        headers['accept'] = '*/*';
+        if (extra) Object.keys(extra).forEach(function (name) { headers[name] = extra[name]; });
+        return headers;
+      }
+
+      function igFetch(path) {
+        return fetch(path, {
+          credentials: 'include',
+          headers: igHeaders({ accept: 'application/json' })
+        }).then(function (response) { return response.ok ? response.json() : null; });
       }
 
       function timeAgo(takenAt) {
@@ -309,24 +374,40 @@ enum ContentFilterScript {
       }
 
       function postForm(path, fields) {
-        var csrf = csrfToken();
         return fetch(path, {
           method: 'POST',
           credentials: 'include',
-          headers: {
-            'x-csrftoken': csrf,
-            'x-ig-app-id': IG_APP_ID,
-            'x-asbd-id': '129477',
-            'x-requested-with': 'XMLHttpRequest',
-            'content-type': 'application/x-www-form-urlencoded'
-          },
+          headers: igHeaders({ 'content-type': 'application/x-www-form-urlencoded' }),
           body: new URLSearchParams(fields).toString()
         }).then(function (response) { return response.ok; }).catch(function () { return false; });
       }
 
-      // Instagram has moved its "story seen" call around over the years.
-      // Try each known shape until one is accepted; the row also keeps its
-      // own local record, so rings/gating don't depend on this succeeding.
+      // Instagram has moved its "seen" calls around over the years. Each
+      // caller lists the shapes it knows; the first one the server accepts
+      // is remembered (per list name) so later calls go straight to it
+      // instead of racking up failed POSTs. A shape that fails once is
+      // skipped from then on. The UI keeps its own local seen record, so
+      // nothing visible depends on this succeeding.
+      var seenShapes = {};
+      function postFirstAccepted(name, attempts) {
+        var memo = seenShapes[name] || (seenShapes[name] = { working: -1, failed: {} });
+        var order = [];
+        if (memo.working >= 0) order.push(memo.working);
+        for (var i = 0; i < attempts.length; i++) {
+          if (i !== memo.working && !memo.failed[i]) order.push(i);
+        }
+        return (function tryNext(n) {
+          if (n >= order.length) return Promise.resolve(false);
+          var index = order[n];
+          return attempts[index]().then(function (ok) {
+            if (ok) { memo.working = index; return true; }
+            memo.failed[index] = true;
+            if (memo.working === index) memo.working = -1;
+            return tryNext(n + 1);
+          });
+        })(0);
+      }
+
       function cacheReelData(key, data) {
         var items = data && Array.isArray(data.items) ? data.items : [];
         reelCache[key] = Promise.resolve({ reelId: data && data.id ? String(data.id) : key, items: items });
@@ -411,10 +492,7 @@ enum ContentFilterScript {
             });
           }
         ];
-        (function tryNext(i) {
-          if (i >= attempts.length) return;
-          attempts[i]().then(function (ok) { if (!ok) tryNext(i + 1); });
-        })(0);
+        postFirstAccepted('story', attempts);
       }
 
       // ---- UI --------------------------------------------------------
@@ -433,7 +511,9 @@ enum ContentFilterScript {
         root.setAttribute(MARK, 'true');
 
         var style = document.createElement('style');
-        style.textContent = '@keyframes inr-spin{to{transform:rotate(360deg)}}';
+        style.textContent = '@keyframes inr-spin{to{transform:rotate(360deg)}}' +
+          '@keyframes inr-pop{0%{transform:scale(1)}40%{transform:scale(1.35)}100%{transform:scale(1)}}' +
+          '[' + MARK + '] input::placeholder{color:rgba(255,255,255,.75)}';
         root.appendChild(style);
 
         var media = el('div', 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;');
@@ -465,7 +545,44 @@ enum ContentFilterScript {
         top.appendChild(bar);
         root.appendChild(top);
 
-        ui = { root: root, media: media, img: img, video: video, loading: loading, progress: progress, avatar: avatar, name: name, time: time, mute: mute, close: close };
+        // Bottom bar, like Instagram's own viewer: a reply field that
+        // sends a DM to the story's owner, and a heart that likes the
+        // story. Hidden for non-story content (chat photos).
+        var bottom = el('div', 'position:absolute;left:0;right:0;bottom:0;padding:16px 12px calc(14px + env(safe-area-inset-bottom));display:flex;align-items:center;gap:12px;background:linear-gradient(rgba(0,0,0,0),rgba(0,0,0,.55));');
+        var reply = el('input', 'flex:1;min-width:0;height:44px;border-radius:22px;border:1px solid rgba(255,255,255,.7);background:transparent;color:#fff;padding:0 16px;font-size:15px;outline:none;-webkit-user-select:text;user-select:text;-webkit-appearance:none;', { type: 'text', autocomplete: 'off', autocorrect: 'on', autocapitalize: 'sentences', enterkeyhint: 'send' });
+        var send = el('button', 'display:none;background:none;border:0;color:#fff;font-size:15px;font-weight:600;padding:0 4px;line-height:44px;');
+        send.textContent = 'Send';
+        var like = el('button', 'background:none;border:0;padding:0 4px;line-height:0;width:36px;height:44px;');
+        like.innerHTML = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round"><path d="M16.8 3.6c-1.9 0-3.6 1-4.8 2.6-1.2-1.6-2.9-2.6-4.8-2.6C4 3.6 1.8 5.9 1.8 9c0 5.6 10.2 11.4 10.2 11.4S22.2 14.6 22.2 9c0-3.1-2.2-5.4-5.4-5.4z"/></svg>';
+        var likePath = like.querySelector('path');
+        bottom.appendChild(reply);
+        bottom.appendChild(send);
+        bottom.appendChild(like);
+        root.appendChild(bottom);
+
+        ui = { root: root, media: media, img: img, video: video, loading: loading, progress: progress, avatar: avatar, name: name, time: time, mute: mute, close: close, bottom: bottom, reply: reply, send: send, like: like, likePath: likePath };
+
+        // Typing pauses the story; leaving the field lets it run again.
+        bottom.addEventListener('pointerdown', function (event) { event.stopPropagation(); });
+        reply.addEventListener('focus', function () {
+          if (!state) return;
+          state.composing = true;
+          pause();
+        });
+        reply.addEventListener('blur', function () {
+          if (!state || !state.composing) return;
+          state.composing = false;
+          if (!reply.value) resume();
+        });
+        reply.addEventListener('input', function () {
+          send.style.display = reply.value.trim() ? '' : 'none';
+        });
+        reply.addEventListener('keydown', function (event) {
+          event.stopPropagation();
+          if (event.key === 'Enter') { event.preventDefault(); sendReply(); }
+        });
+        send.addEventListener('click', function (event) { event.stopPropagation(); sendReply(); });
+        like.addEventListener('click', function (event) { event.stopPropagation(); toggleLike(); });
 
         close.addEventListener('click', function (event) { event.stopPropagation(); closeViewer(); });
         mute.addEventListener('click', function (event) {
@@ -499,11 +616,119 @@ enum ContentFilterScript {
       function showLoading() { ui.loading.style.display = ''; }
       function hideLoading() { ui.loading.style.display = 'none'; }
 
+      // ---- Like / reply ----------------------------------------------
+      function uuid() {
+        if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+          var r = Math.random() * 16 | 0;
+          return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+        });
+      }
+
+      function currentStory() {
+        if (!state) return null;
+        var reel = state.reels[state.userIndex];
+        var item = state.items[state.itemIndex];
+        if (!reel || !item || reel.items) return null; // chat photos: no story interactions
+        return { reel: reel, item: item, mediaId: String(item.pk || '') + '_' + String(reel.userPk), ownerPk: String(reel.userPk) };
+      }
+
+      function note(message) {
+        var toast = el('div', 'position:absolute;left:50%;bottom:90px;transform:translateX(-50%);padding:8px 14px;border-radius:10px;background:rgba(255,255,255,.92);color:#000;font-size:13px;font-weight:600;pointer-events:none;');
+        toast.textContent = message;
+        ui.root.appendChild(toast);
+        setTimeout(function () { toast.remove(); }, 1600);
+      }
+
+      function renderLike(liked, animate) {
+        ui.likePath.setAttribute('fill', liked ? '#ff3040' : 'none');
+        ui.likePath.setAttribute('stroke', liked ? '#ff3040' : '#fff');
+        if (animate) {
+          ui.like.style.animation = 'none';
+          void ui.like.offsetWidth;
+          ui.like.style.animation = 'inr-pop .35s ease';
+        }
+      }
+
+      function renderInteractions() {
+        var story = currentStory();
+        ui.bottom.style.display = story ? '' : 'none';
+        if (!story) return;
+        ui.reply.value = '';
+        ui.send.style.display = 'none';
+        ui.reply.placeholder = 'Reply to ' + story.reel.username + '…';
+        var liked = state.likes[story.mediaId];
+        if (liked === undefined) liked = !!story.item.has_liked;
+        renderLike(liked, false);
+      }
+
+      function toggleLike() {
+        var story = currentStory();
+        if (!story) return;
+        var liked = state.likes[story.mediaId];
+        if (liked === undefined) liked = !!story.item.has_liked;
+        liked = !liked;
+        state.likes[story.mediaId] = liked;
+        renderLike(liked, liked);
+        var mediaId = story.mediaId;
+        postForm('/api/v1/story_interactions/' + (liked ? 'send' : 'unsend') + '_story_like/', {
+          media_id: mediaId,
+          reel_id: story.ownerPk,
+          container_module: 'reel_feed_timeline',
+          tray_session_id: state.traySessionId,
+          viewer_session_id: state.viewerSessionId
+        }).then(function (ok) {
+          if (ok || !state || state.likes[mediaId] !== liked) return;
+          state.likes[mediaId] = !liked;
+          renderLike(!liked, false);
+          note("Couldn't " + (liked ? 'like' : 'unlike') + ' this story');
+        });
+      }
+
+      function sendReply() {
+        var story = currentStory();
+        if (!story) return;
+        var text = ui.reply.value.trim();
+        if (!text || state.sending) return;
+        state.sending = true;
+        var token = uuid();
+        ui.send.style.opacity = '.5';
+        postForm('/api/v1/direct_v2/threads/broadcast/reel_share/', {
+          action: 'send_item',
+          client_context: token,
+          mutation_token: token,
+          offline_threading_id: token,
+          media_id: story.mediaId,
+          reel_id: story.ownerPk,
+          text: text,
+          entry: 'reel',
+          send_attribution: 'reel_feed_timeline',
+          recipient_users: JSON.stringify([[story.ownerPk]])
+        }).then(function (ok) {
+          if (!state) return;
+          state.sending = false;
+          ui.send.style.opacity = '';
+          if (!ok) { note("Couldn't send the message"); return; }
+          ui.reply.value = '';
+          ui.send.style.display = 'none';
+          ui.reply.blur();
+          state.composing = false;
+          note('Sent');
+          resume();
+        });
+      }
+
       // ---- Gestures: tap = prev/next, hold = pause, swipe down = close,
       // swipe sideways = prev/next person.
       var pointer = null;
       function onPointerDown(event) {
         if (!state) return;
+        if (state.composing) {
+          // Tapping the story while typing just dismisses the keyboard.
+          ui.reply.blur();
+          pointer = null;
+          return;
+        }
         pointer = { x: event.clientX, y: event.clientY, at: Date.now(), held: false, timer: null };
         pointer.timer = setTimeout(function () {
           if (!pointer) return;
@@ -628,6 +853,7 @@ enum ContentFilterScript {
         var videoURL = item.media_type === 2 ? bestVideo(item) : '';
         state.currentIsVideo = !!videoURL;
         renderMute();
+        renderInteractions();
 
         if (videoURL) {
           ui.img.style.display = 'none';
@@ -748,6 +974,9 @@ enum ContentFilterScript {
         ui.video.removeAttribute('src');
         ui.video.load();
         ui.img.removeAttribute('src');
+        ui.reply.blur();
+        ui.reply.value = '';
+        ui.send.style.display = 'none';
         ui.root.remove();
         document.documentElement.style.overflow = state.previousOverflow;
         var callbacks = state.callbacks;
@@ -775,6 +1004,11 @@ enum ContentFilterScript {
           elapsedBeforePause: 0,
           raf: 0,
           loadToken: 0,
+          likes: {},
+          composing: false,
+          sending: false,
+          traySessionId: uuid(),
+          viewerSessionId: uuid(),
           callbacks: callbacks || {},
           previousOverflow: document.documentElement.style.overflow
         };
@@ -784,7 +1018,15 @@ enum ContentFilterScript {
         return true;
       }
 
-      window.__instaNoReelsViewer = { open: open, close: closeViewer, prefetch: prefetch, isOpen: function () { return !!state; } };
+      window.__instaNoReelsViewer = {
+        open: open,
+        close: closeViewer,
+        prefetch: prefetch,
+        isOpen: function () { return !!state; },
+        // Shared request layer for the other scripts, so every call we
+        // make to Instagram's internal API goes out the same way.
+        api: { get: igFetch, post: postForm, postFirstAccepted: postFirstAccepted, headers: igHeaders }
+      };
     })();
     """#
 
@@ -1625,10 +1867,18 @@ enum ContentFilterScript {
         }, 200);
       }
 
-      // Instagram's web app id, sent by the site itself on its internal
-      // API calls; the endpoints reject requests without it.
+      // Calls to Instagram's internal API go through the story viewer's
+      // request layer, which stamps them with the same session headers
+      // the page itself sends. The fallback only matters if the viewer
+      // script failed to load.
       var IG_APP_ID = '936619743392459';
+      function viewerAPI() {
+        var viewer = window.__instaNoReelsViewer;
+        return viewer && viewer.api ? viewer.api : null;
+      }
       function igFetch(path) {
+        var api = viewerAPI();
+        if (api) return api.get(path);
         return fetch(path, {
           credentials: 'include',
           headers: { 'x-ig-app-id': IG_APP_ID, 'x-requested-with': 'XMLHttpRequest', 'accept': 'application/json' }
@@ -1970,53 +2220,119 @@ enum ContentFilterScript {
         return match ? match[1] : null;
       }
 
-      function toast(message) {
+      function toast(message, duration) {
         var note = document.createElement('div');
         note.textContent = message;
-        note.style.cssText = 'position:fixed;left:50%;bottom:90px;transform:translateX(-50%);max-width:80%;padding:10px 16px;border-radius:12px;background:rgba(0,0,0,.85);color:#fff;font-size:14px;line-height:1.35;text-align:center;z-index:2147483001;';
+        note.style.cssText = 'position:fixed;left:50%;bottom:90px;transform:translateX(-50%);max-width:86%;padding:10px 16px;border-radius:12px;background:rgba(0,0,0,.88);color:#fff;font-size:13px;line-height:1.35;text-align:center;z-index:2147483001;word-break:break-word;';
         document.body.appendChild(note);
-        setTimeout(function () { note.remove(); }, 2800);
+        setTimeout(function () { note.remove(); }, duration || 2800);
       }
 
+      // Mark a disappearing photo / video viewed, the same way the story
+      // viewer marks stories: through its request layer (page-matching
+      // headers), trying the known endpoint shapes once and remembering
+      // the one the server accepts.
       function markVisualMessageSeen(threadID, itemID) {
-        var csrf = (/(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '') || [])[1];
-        if (!csrf) return;
-        fetch('/api/v1/direct_v2/visual_threads/' + encodeURIComponent(threadID) + '/item_seen/', {
-          method: 'POST',
-          credentials: 'include',
-          headers: {
-            'x-csrftoken': csrf,
-            'x-ig-app-id': IG_APP_ID,
-            'x-asbd-id': '129477',
-            'x-requested-with': 'XMLHttpRequest',
-            'content-type': 'application/x-www-form-urlencoded'
+        var api = viewerAPI();
+        if (!api) return;
+        var thread = encodeURIComponent(threadID);
+        var item = encodeURIComponent(itemID);
+        api.postFirstAccepted('visualMessage', [
+          function () {
+            return api.post('/api/v1/direct_v2/visual_threads/' + thread + '/item_seen/', {
+              item_ids: JSON.stringify([itemID]),
+              target_item_type: 'raven_media'
+            });
           },
-          body: new URLSearchParams({ item_ids: JSON.stringify([itemID]), target_item_type: 'raven_media' }).toString()
-        }).catch(function () {});
+          function () {
+            return api.post('/api/v1/direct_v2/threads/' + thread + '/items/' + item + '/seen/', {
+              use_unified_inbox: 'true',
+              action: 'mark_seen',
+              thread_id: threadID,
+              item_id: itemID
+            });
+          }
+        ]);
+      }
+
+      // Pull the media out of a thread item, whichever of the shapes
+      // Instagram has used it comes in.
+      function visualMediaFrom(item) {
+        var containers = [item.visual_media, item.raven_media, item.media, item.xma_media_share];
+        for (var i = 0; i < containers.length; i++) {
+          var c = containers[i];
+          if (!c) continue;
+          var m = c.media || c;
+          if (m && (m.image_versions2 || m.video_versions)) return m;
+        }
+        return null;
+      }
+
+      // Short description of what the thread returned, for the diagnostic
+      // note when nothing displayable was found.
+      function describeItems(items) {
+        var parts = [];
+        items.slice(0, 40).forEach(function (item) {
+          if (!/raven|visual|xma|media/.test(item.item_type || '')) return;
+          var desc = item.item_type;
+          var visual = item.visual_media || item.raven_media;
+          if (visual) {
+            desc += ' vm[' + Object.keys(visual).slice(0, 8).join(',') + ']';
+            if (visual.media) desc += ' media[' + Object.keys(visual.media).slice(0, 8).join(',') + ']';
+            if (visual.seen_count !== undefined) desc += ' seen=' + visual.seen_count;
+            if (visual.view_mode) desc += ' mode=' + visual.view_mode;
+          }
+          parts.push(desc);
+        });
+        return parts.length ? parts.slice(0, 4).join(' | ') : 'no visual items among ' + items.length;
+      }
+
+      function fetchThreadItems(threadID, variant) {
+        var query = variant === 0
+          ? 'visual_message_return_type=unseen&direction=older&limit=20'
+          : 'visual_message_return_type=all&direction=older&limit=20';
+        return igFetch('/api/v1/direct_v2/threads/' + encodeURIComponent(threadID) + '/?' + query).then(function (json) {
+          var thread = json && json.thread;
+          return {
+            thread: thread,
+            items: thread && Array.isArray(thread.items) ? thread.items : [],
+            users: thread && Array.isArray(thread.users) ? thread.users : []
+          };
+        });
       }
 
       function openVisualMessages(threadID) {
-        igFetch('/api/v1/direct_v2/threads/' + encodeURIComponent(threadID) + '/?visual_message_return_type=unseen&direction=older&limit=20').then(function (json) {
-          var thread = json && json.thread;
-          var items = thread && Array.isArray(thread.items) ? thread.items : [];
-          var users = thread && Array.isArray(thread.users) ? thread.users : [];
-          var media = [];
-          items.forEach(function (item) {
-            var visual = item.visual_media || item.raven_media;
-            var m = visual && visual.media;
-            if (!m || (!m.image_versions2 && !m.video_versions)) return;
-            media.push({
-              pk: m.pk || item.item_id,
-              itemID: item.item_id,
-              senderID: String(item.user_id || ''),
-              media_type: m.media_type || (m.video_versions ? 2 : 1),
-              image_versions2: m.image_versions2,
-              video_versions: m.video_versions,
-              taken_at: item.timestamp ? Math.floor(item.timestamp / 1000000) : 0
+        fetchThreadItems(threadID, 0).then(function (first) {
+          var collect = function (result) {
+            var media = [];
+            result.items.forEach(function (item) {
+              var m = visualMediaFrom(item);
+              if (!m) return;
+              if (!/raven|visual/.test(item.item_type || '') && !item.visual_media) return;
+              media.push({
+                pk: m.pk || item.item_id,
+                itemID: item.item_id,
+                senderID: String(item.user_id || ''),
+                media_type: m.media_type || (m.video_versions ? 2 : 1),
+                image_versions2: m.image_versions2,
+                video_versions: m.video_versions,
+                taken_at: item.timestamp ? Math.floor(item.timestamp / 1000000) : 0
+              });
             });
+            return media;
+          };
+          var media = collect(first);
+          if (media.length) return { result: first, media: media };
+          return fetchThreadItems(threadID, 1).then(function (second) {
+            var more = collect(second);
+            return { result: more.length ? second : first, media: more };
           });
+        }).then(function (found) {
+          var media = found.media;
+          var thread = found.result.thread;
+          var users = found.result.users;
           if (!media.length) {
-            toast('Nothing to show — these photos may have expired or already been viewed.');
+            toast('Nothing displayable came back. Details: ' + describeItems(found.result.items), 12000);
             return;
           }
           media.sort(function (a, b) { return a.taken_at - b.taken_at; });
