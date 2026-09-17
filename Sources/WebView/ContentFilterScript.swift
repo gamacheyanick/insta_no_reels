@@ -313,11 +313,20 @@ enum ContentFilterScript {
       // bootstrap script), so the request carries the same session
       // headers as Instagram's, and fill in the few we know when the
       // page hasn't made a call yet.
-      function igHeaders(extra) {
-        var captured = window.__instaNoReelsHeaders || {};
+      // Two header sets: "borrowed" copies what the page sends, "minimal"
+      // is the small fixed set that is known to be accepted. Requests go
+      // out with the borrowed set; if the server rejects one (4xx) the
+      // same request is retried with the minimal set, and if that works
+      // the minimal set is used from then on.
+      var headerMode = 'borrowed';
+      var lastStatus = 0;
+      function igHeaders(extra, mode) {
         var headers = {};
-        Object.keys(captured).forEach(function (name) { headers[name] = captured[name]; });
-        if (!headers['x-ig-app-id']) headers['x-ig-app-id'] = IG_APP_ID;
+        if ((mode || headerMode) === 'borrowed') {
+          var captured = window.__instaNoReelsHeaders || {};
+          Object.keys(captured).forEach(function (name) { headers[name] = captured[name]; });
+        }
+        headers['x-ig-app-id'] = IG_APP_ID;
         if (!headers['x-asbd-id']) headers['x-asbd-id'] = '129477';
         var csrf = csrfToken();
         if (csrf) headers['x-csrftoken'] = csrf;
@@ -327,11 +336,29 @@ enum ContentFilterScript {
         return headers;
       }
 
+      function igRequest(path, init, extra) {
+        function attempt(mode) {
+          var options = {};
+          Object.keys(init || {}).forEach(function (key) { options[key] = init[key]; });
+          options.credentials = 'include';
+          options.headers = igHeaders(extra, mode);
+          return fetch(path, options);
+        }
+        var mode = headerMode;
+        return attempt(mode).then(function (response) {
+          lastStatus = response.status;
+          if (response.ok || mode !== 'borrowed' || response.status < 400 || response.status >= 500) return response;
+          return attempt('minimal').then(function (retry) {
+            lastStatus = retry.status;
+            if (retry.ok) headerMode = 'minimal';
+            return retry;
+          });
+        });
+      }
+
       function igFetch(path) {
-        return fetch(path, {
-          credentials: 'include',
-          headers: igHeaders({ accept: 'application/json' })
-        }).then(function (response) { return response.ok ? response.json() : null; });
+        return igRequest(path, {}, { accept: 'application/json' })
+          .then(function (response) { return response.ok ? response.json() : null; });
       }
 
       function timeAgo(takenAt) {
@@ -374,12 +401,11 @@ enum ContentFilterScript {
       }
 
       function postForm(path, fields) {
-        return fetch(path, {
+        return igRequest(path, {
           method: 'POST',
-          credentials: 'include',
-          headers: igHeaders({ 'content-type': 'application/x-www-form-urlencoded' }),
           body: new URLSearchParams(fields).toString()
-        }).then(function (response) { return response.ok; }).catch(function () { return false; });
+        }, { 'content-type': 'application/x-www-form-urlencoded' })
+          .then(function (response) { return response.ok; }).catch(function () { return false; });
       }
 
       // Instagram has moved its "seen" calls around over the years. Each
@@ -1025,7 +1051,14 @@ enum ContentFilterScript {
         isOpen: function () { return !!state; },
         // Shared request layer for the other scripts, so every call we
         // make to Instagram's internal API goes out the same way.
-        api: { get: igFetch, post: postForm, postFirstAccepted: postFirstAccepted, headers: igHeaders }
+        api: {
+          get: igFetch,
+          post: postForm,
+          postFirstAccepted: postFirstAccepted,
+          headers: igHeaders,
+          lastStatus: function () { return lastStatus; },
+          headerMode: function () { return headerMode; }
+        }
       };
     })();
     """#
@@ -2301,8 +2334,62 @@ enum ContentFilterScript {
         });
       }
 
-      function openVisualMessages(threadID) {
-        fetchThreadItems(threadID, 0).then(function (first) {
+      // The id in the /direct/t/<id> URL is not always the id the thread
+      // endpoint wants (newer inboxes use a different id in the URL). Try
+      // it directly first; if that fails, find the conversation in the
+      // inbox listing, matched by either id or by the person named in the
+      // chat header, and use its real thread id.
+      var threadIDCache = {};
+      function headerUsername() {
+        var links = document.querySelectorAll('a[href]');
+        for (var i = 0; i < links.length; i++) {
+          var rect = links[i].getBoundingClientRect();
+          if (rect.bottom > 140 || rect.height === 0) continue;
+          var match = /^\/([A-Za-z0-9._]+)\/?(?:[?#].*)?$/.exec(links[i].getAttribute('href') || '');
+          if (match && ['direct', 'explore', 'reels', 'accounts', 'stories', 'p', 'reel'].indexOf(match[1]) < 0) return match[1];
+        }
+        return null;
+      }
+      function resolveThread(urlThreadID) {
+        var cached = threadIDCache[urlThreadID];
+        if (cached) return Promise.resolve({ id: cached, first: null });
+        return fetchThreadItems(urlThreadID, 0).then(function (first) {
+          if (first.thread) {
+            threadIDCache[urlThreadID] = urlThreadID;
+            return { id: urlThreadID, first: first };
+          }
+          var directStatus = viewerAPI() ? viewerAPI().lastStatus() : 0;
+          return igFetch('/api/v1/direct_v2/inbox/?visual_message_return_type=unseen&thread_message_limit=1&persistentBadging=true&limit=40').then(function (json) {
+            var threads = json && json.inbox && Array.isArray(json.inbox.threads) ? json.inbox.threads : [];
+            var found = null;
+            threads.forEach(function (t) {
+              if (!found && (String(t.thread_v2_id || '') === urlThreadID || String(t.thread_id || '') === urlThreadID)) found = t;
+            });
+            var name = headerUsername();
+            if (!found && name) {
+              threads.forEach(function (t) {
+                var users = Array.isArray(t.users) ? t.users : [];
+                if (!found && users.length === 1 && users[0].username === name) found = t;
+              });
+            }
+            if (!found || !found.thread_id) {
+              return { id: null, first: null, why: 'thread lookup HTTP ' + directStatus + ', inbox ' + (json ? threads.length + ' threads, no match for ' + (name || urlThreadID) : 'HTTP ' + (viewerAPI() ? viewerAPI().lastStatus() : 0)) };
+            }
+            threadIDCache[urlThreadID] = String(found.thread_id);
+            return { id: String(found.thread_id), first: null };
+          });
+        });
+      }
+
+      function openVisualMessages(urlThreadID) {
+        var threadID = urlThreadID;
+        resolveThread(urlThreadID).then(function (resolved) {
+          if (!resolved.id) {
+            toast("Couldn't find this conversation: " + resolved.why, 12000);
+            return null;
+          }
+          threadID = resolved.id;
+          return (resolved.first ? Promise.resolve(resolved.first) : fetchThreadItems(threadID, 0)).then(function (first) {
           var collect = function (result) {
             var media = [];
             result.items.forEach(function (item) {
@@ -2327,12 +2414,15 @@ enum ContentFilterScript {
             var more = collect(second);
             return { result: more.length ? second : first, media: more };
           });
+          });
         }).then(function (found) {
+          if (!found) return;
           var media = found.media;
           var thread = found.result.thread;
           var users = found.result.users;
           if (!media.length) {
-            toast('Nothing displayable came back. Details: ' + describeItems(found.result.items), 12000);
+            var status = viewerAPI() ? viewerAPI().lastStatus() : 0;
+            toast('Nothing displayable came back (HTTP ' + status + ', thread ' + threadID + '). Details: ' + describeItems(found.result.items), 12000);
             return;
           }
           media.sort(function (a, b) { return a.taken_at - b.taken_at; });
