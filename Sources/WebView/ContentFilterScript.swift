@@ -364,7 +364,17 @@ enum ContentFilterScript {
         return igRequest(path, {
           method: 'POST',
           body: new URLSearchParams(fields).toString()
-        }).then(function (response) { return response.ok; }).catch(function () { return false; });
+        }).then(function (response) {
+          if (response.ok) return true;
+          // Keep the server's own reason (e.g. "login_required", "Invalid
+          // parameters") so failure notes say what actually went wrong.
+          return response.text().then(function (text) {
+            var message = '';
+            try { var json = JSON.parse(text); message = json.message || json.error_title || json.status || ''; } catch (e) { message = /<html/i.test(text) ? 'HTML page' : text.slice(0, 80); }
+            lastError = message;
+            return false;
+          }, function () { return false; });
+        }).catch(function () { return false; });
       }
 
       // Instagram has moved its "seen" calls around over the years. Each
@@ -496,9 +506,7 @@ enum ContentFilterScript {
         root.setAttribute(MARK, 'true');
 
         var style = document.createElement('style');
-        style.textContent = '@keyframes inr-spin{to{transform:rotate(360deg)}}' +
-          '@keyframes inr-pop{0%{transform:scale(1)}40%{transform:scale(1.35)}100%{transform:scale(1)}}' +
-          '[' + MARK + '] input::placeholder{color:rgba(255,255,255,.75)}';
+        style.textContent = '@keyframes inr-spin{to{transform:rotate(360deg)}}';
         root.appendChild(style);
 
         var media = el('div', 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;');
@@ -530,44 +538,7 @@ enum ContentFilterScript {
         top.appendChild(bar);
         root.appendChild(top);
 
-        // Bottom bar, like Instagram's own viewer: a reply field that
-        // sends a DM to the story's owner, and a heart that likes the
-        // story. Hidden for non-story content (chat photos).
-        var bottom = el('div', 'position:absolute;left:0;right:0;bottom:0;padding:16px 12px calc(14px + env(safe-area-inset-bottom));display:flex;align-items:center;gap:12px;background:linear-gradient(rgba(0,0,0,0),rgba(0,0,0,.55));');
-        var reply = el('input', 'flex:1;min-width:0;height:44px;border-radius:22px;border:1px solid rgba(255,255,255,.7);background:transparent;color:#fff;padding:0 16px;font-size:15px;outline:none;-webkit-user-select:text;user-select:text;-webkit-appearance:none;', { type: 'text', autocomplete: 'off', autocorrect: 'on', autocapitalize: 'sentences', enterkeyhint: 'send' });
-        var send = el('button', 'display:none;background:none;border:0;color:#fff;font-size:15px;font-weight:600;padding:0 4px;line-height:44px;');
-        send.textContent = 'Send';
-        var like = el('button', 'background:none;border:0;padding:0 4px;line-height:0;width:36px;height:44px;');
-        like.innerHTML = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round"><path d="M16.8 3.6c-1.9 0-3.6 1-4.8 2.6-1.2-1.6-2.9-2.6-4.8-2.6C4 3.6 1.8 5.9 1.8 9c0 5.6 10.2 11.4 10.2 11.4S22.2 14.6 22.2 9c0-3.1-2.2-5.4-5.4-5.4z"/></svg>';
-        var likePath = like.querySelector('path');
-        bottom.appendChild(reply);
-        bottom.appendChild(send);
-        bottom.appendChild(like);
-        root.appendChild(bottom);
-
-        ui = { root: root, media: media, img: img, video: video, loading: loading, progress: progress, avatar: avatar, name: name, time: time, mute: mute, close: close, bottom: bottom, reply: reply, send: send, like: like, likePath: likePath };
-
-        // Typing pauses the story; leaving the field lets it run again.
-        bottom.addEventListener('pointerdown', function (event) { event.stopPropagation(); });
-        reply.addEventListener('focus', function () {
-          if (!state) return;
-          state.composing = true;
-          pause();
-        });
-        reply.addEventListener('blur', function () {
-          if (!state || !state.composing) return;
-          state.composing = false;
-          if (!reply.value) resume();
-        });
-        reply.addEventListener('input', function () {
-          send.style.display = reply.value.trim() ? '' : 'none';
-        });
-        reply.addEventListener('keydown', function (event) {
-          event.stopPropagation();
-          if (event.key === 'Enter') { event.preventDefault(); sendReply(); }
-        });
-        send.addEventListener('click', function (event) { event.stopPropagation(); sendReply(); });
-        like.addEventListener('click', function (event) { event.stopPropagation(); toggleLike(); });
+        ui = { root: root, media: media, img: img, video: video, loading: loading, progress: progress, avatar: avatar, name: name, time: time, mute: mute, close: close };
 
         close.addEventListener('click', function (event) { event.stopPropagation(); closeViewer(); });
         mute.addEventListener('click', function (event) {
@@ -601,30 +572,6 @@ enum ContentFilterScript {
       function showLoading() { ui.loading.style.display = ''; }
       function hideLoading() { ui.loading.style.display = 'none'; }
 
-      // ---- Like / reply ----------------------------------------------
-      function uuid() {
-        if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-          var r = Math.random() * 16 | 0;
-          return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
-        });
-      }
-
-      function currentStory() {
-        if (!state) return null;
-        var reel = state.reels[state.userIndex];
-        var item = state.items[state.itemIndex];
-        if (!reel || !item || reel.items) return null; // chat photos: no story interactions
-        return { reel: reel, item: item, mediaId: String(item.pk || '') + '_' + String(reel.userPk), ownerPk: String(reel.userPk) };
-      }
-
-      function note(message) {
-        var toast = el('div', 'position:absolute;left:50%;bottom:90px;transform:translateX(-50%);padding:8px 14px;border-radius:10px;background:rgba(255,255,255,.92);color:#000;font-size:13px;font-weight:600;pointer-events:none;');
-        toast.textContent = message;
-        ui.root.appendChild(toast);
-        setTimeout(function () { toast.remove(); }, 1600);
-      }
-
       // A note that outlives the viewer (it sits on the page, not in the
       // viewer), for problems worth reporting after the viewer closes.
       function docNote(message) {
@@ -634,95 +581,11 @@ enum ContentFilterScript {
         setTimeout(function () { toast.remove(); }, 10000);
       }
 
-      function renderLike(liked, animate) {
-        ui.likePath.setAttribute('fill', liked ? '#ff3040' : 'none');
-        ui.likePath.setAttribute('stroke', liked ? '#ff3040' : '#fff');
-        if (animate) {
-          ui.like.style.animation = 'none';
-          void ui.like.offsetWidth;
-          ui.like.style.animation = 'inr-pop .35s ease';
-        }
-      }
-
-      function renderInteractions() {
-        var story = currentStory();
-        ui.bottom.style.display = story ? '' : 'none';
-        if (!story) return;
-        ui.reply.value = '';
-        ui.send.style.display = 'none';
-        ui.reply.placeholder = 'Reply to ' + story.reel.username + '…';
-        var liked = state.likes[story.mediaId];
-        if (liked === undefined) liked = !!story.item.has_liked;
-        renderLike(liked, false);
-      }
-
-      function toggleLike() {
-        var story = currentStory();
-        if (!story) return;
-        var liked = state.likes[story.mediaId];
-        if (liked === undefined) liked = !!story.item.has_liked;
-        liked = !liked;
-        state.likes[story.mediaId] = liked;
-        renderLike(liked, liked);
-        var mediaId = story.mediaId;
-        postForm('/api/v1/story_interactions/' + (liked ? 'send' : 'unsend') + '_story_like/', {
-          media_id: mediaId,
-          reel_id: story.ownerPk,
-          container_module: 'reel_feed_timeline',
-          tray_session_id: state.traySessionId,
-          viewer_session_id: state.viewerSessionId
-        }).then(function (ok) {
-          if (ok || !state || state.likes[mediaId] !== liked) return;
-          state.likes[mediaId] = !liked;
-          renderLike(!liked, false);
-          note("Couldn't " + (liked ? 'like' : 'unlike') + ' this story');
-        });
-      }
-
-      function sendReply() {
-        var story = currentStory();
-        if (!story) return;
-        var text = ui.reply.value.trim();
-        if (!text || state.sending) return;
-        state.sending = true;
-        var token = uuid();
-        ui.send.style.opacity = '.5';
-        postForm('/api/v1/direct_v2/threads/broadcast/reel_share/', {
-          action: 'send_item',
-          client_context: token,
-          mutation_token: token,
-          offline_threading_id: token,
-          media_id: story.mediaId,
-          reel_id: story.ownerPk,
-          text: text,
-          entry: 'reel',
-          send_attribution: 'reel_feed_timeline',
-          recipient_users: JSON.stringify([[story.ownerPk]])
-        }).then(function (ok) {
-          if (!state) return;
-          state.sending = false;
-          ui.send.style.opacity = '';
-          if (!ok) { note("Couldn't send the message"); return; }
-          ui.reply.value = '';
-          ui.send.style.display = 'none';
-          ui.reply.blur();
-          state.composing = false;
-          note('Sent');
-          resume();
-        });
-      }
-
       // ---- Gestures: tap = prev/next, hold = pause, swipe down = close,
       // swipe sideways = prev/next person.
       var pointer = null;
       function onPointerDown(event) {
         if (!state) return;
-        if (state.composing) {
-          // Tapping the story while typing just dismisses the keyboard.
-          ui.reply.blur();
-          pointer = null;
-          return;
-        }
         pointer = { x: event.clientX, y: event.clientY, at: Date.now(), held: false, timer: null };
         pointer.timer = setTimeout(function () {
           if (!pointer) return;
@@ -847,7 +710,6 @@ enum ContentFilterScript {
         var videoURL = item.media_type === 2 ? bestVideo(item) : '';
         state.currentIsVideo = !!videoURL;
         renderMute();
-        renderInteractions();
 
         if (videoURL) {
           ui.img.style.display = 'none';
@@ -974,9 +836,6 @@ enum ContentFilterScript {
         ui.video.removeAttribute('src');
         ui.video.load();
         ui.img.removeAttribute('src');
-        ui.reply.blur();
-        ui.reply.value = '';
-        ui.send.style.display = 'none';
         ui.root.remove();
         document.documentElement.style.overflow = state.previousOverflow;
         var callbacks = state.callbacks;
@@ -1004,11 +863,6 @@ enum ContentFilterScript {
           elapsedBeforePause: 0,
           raf: 0,
           loadToken: 0,
-          likes: {},
-          composing: false,
-          sending: false,
-          traySessionId: uuid(),
-          viewerSessionId: uuid(),
           callbacks: callbacks || {},
           previousOverflow: document.documentElement.style.overflow
         };
@@ -2299,41 +2153,12 @@ enum ContentFilterScript {
         }
       }
 
-      // Mark a disappearing photo / video viewed on the server, through the
-      // story viewer's request layer, trying the known endpoint shapes and
-      // remembering the one that is accepted. The local record is kept
-      // regardless, so the bubble reads as viewed either way.
+      // Viewing a disappearing photo here is local only: Instagram's seen
+      // endpoints refuse this session, so nothing is sent. The bubble is
+      // dimmed and the id remembered so it reads as viewed on this device.
       function markVisualMessageSeen(threadID, itemID, bubble) {
         recordVisualSeen(itemID);
         markBubbleViewed(bubble);
-        var api = viewerAPI();
-        if (!api) return;
-        var thread = encodeURIComponent(threadID);
-        var item = encodeURIComponent(itemID);
-        var csrf = (/(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '') || [])[1] || '';
-        api.postFirstAccepted('visualMessage', [
-          function () {
-            return api.post('/api/v1/direct_v2/visual_threads/' + thread + '/item_seen/', {
-              item_ids: JSON.stringify([itemID]),
-              target_item_type: 'raven_media',
-              action: 'mark_seen',
-              thread_id: threadID,
-              _csrftoken: csrf,
-              _uuid: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now())
-            });
-          },
-          function () {
-            return api.post('/api/v1/direct_v2/threads/' + thread + '/items/' + item + '/seen/', {
-              use_unified_inbox: 'true',
-              action: 'mark_seen',
-              thread_id: threadID,
-              item_id: itemID,
-              _csrftoken: csrf
-            });
-          }
-        ]).then(function (ok) {
-          if (!ok) toast("Instagram didn't accept the seen call (" + (api.lastFailure ? api.lastFailure() : 'HTTP ' + api.lastStatus()) + '); marked viewed locally.', 6000);
-        });
       }
 
       // Pull the media out of a thread item, whichever of the shapes
