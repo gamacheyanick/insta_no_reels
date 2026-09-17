@@ -198,46 +198,10 @@ enum ContentFilterScript {
         return json;
       }
 
-      // ---- Borrow Instagram's own request headers --------------------
-      // The site stamps every internal API call with a handful of session
-      // headers (www-claim, csrf, rollout hash, ...). Our own calls (story
-      // viewer, chat photos) should carry the same set so they look like
-      // the page's requests rather than a stripped-down client. Remember
-      // the latest value of each as Instagram sends it, plus the claim the
-      // server hands back, and expose them for the other scripts.
-      var CAPTURED_HEADERS = ['x-ig-www-claim', 'x-csrftoken', 'x-instagram-ajax', 'x-asbd-id', 'x-ig-app-id', 'x-web-session-id', 'x-fb-lsd', 'x-bloks-version-id', 'x-ig-d'];
-      var captured = window.__instaNoReelsHeaders = window.__instaNoReelsHeaders || {};
-      function rememberHeader(name, value) {
-        name = String(name || '').toLowerCase();
-        if (CAPTURED_HEADERS.indexOf(name) < 0 || value === undefined || value === null || value === '') return;
-        captured[name] = String(value);
-      }
-      function rememberHeaders(headers) {
-        try {
-          if (!headers) return;
-          if (typeof headers.forEach === 'function' && !Array.isArray(headers)) {
-            headers.forEach(function (value, name) { rememberHeader(name, value); });
-          } else if (Array.isArray(headers)) {
-            headers.forEach(function (pair) { if (pair) rememberHeader(pair[0], pair[1]); });
-          } else if (typeof headers === 'object') {
-            Object.keys(headers).forEach(function (name) { rememberHeader(name, headers[name]); });
-          }
-        } catch (e) {}
-      }
-      function rememberClaim(response) {
-        try {
-          var claim = response && response.headers && response.headers.get('x-ig-set-www-claim');
-          if (claim && claim !== '0') captured['x-ig-www-claim'] = claim;
-        } catch (e) {}
-      }
-
       var originalFetch = window.fetch;
       window.fetch = function (input, init) {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
-        if (init && init.headers) rememberHeaders(init.headers);
-        else if (input && typeof input === 'object' && input.headers) rememberHeaders(input.headers);
         return originalFetch.apply(this, arguments).then(function (response) {
-          rememberClaim(response);
           if (!isSearchURL(url)) return response;
           return response
             .clone()
@@ -265,18 +229,8 @@ enum ContentFilterScript {
           requestUrl = url;
           return originalOpen.apply(xhr, arguments);
         };
-        var originalSetHeader = xhr.setRequestHeader;
-        xhr.setRequestHeader = function (name, value) {
-          rememberHeader(name, value);
-          return originalSetHeader.apply(xhr, arguments);
-        };
         xhr.addEventListener('readystatechange', function () {
-          if (xhr.readyState !== 4) return;
-          try {
-            var claim = xhr.getResponseHeader('x-ig-set-www-claim');
-            if (claim && claim !== '0') captured['x-ig-www-claim'] = claim;
-          } catch (e) {}
-          if (!isSearchURL(requestUrl)) return;
+          if (xhr.readyState !== 4 || !isSearchURL(requestUrl)) return;
           try {
             var filtered = JSON.stringify(keepAccountsOnly(JSON.parse(xhr.responseText)));
             Object.defineProperty(xhr, 'responseText', { value: filtered, configurable: true });
@@ -313,52 +267,51 @@ enum ContentFilterScript {
       // bootstrap script), so the request carries the same session
       // headers as Instagram's, and fill in the few we know when the
       // page hasn't made a call yet.
-      // Two header sets: "borrowed" copies what the page sends, "minimal"
-      // is the small fixed set that is known to be accepted. Requests go
-      // out with the borrowed set; if the server rejects one (4xx) the
-      // same request is retried with the minimal set, and if that works
-      // the minimal set is used from then on.
-      var headerMode = 'borrowed';
+      // The fixed header sets Instagram's internal API is known to accept
+      // from this session: the app id on reads, plus csrf and asbd id on
+      // writes. Anything beyond this has proven to break the story fetch.
       var lastStatus = 0;
-      function igHeaders(extra, mode) {
-        var headers = {};
-        if ((mode || headerMode) === 'borrowed') {
-          var captured = window.__instaNoReelsHeaders || {};
-          Object.keys(captured).forEach(function (name) { headers[name] = captured[name]; });
+      var lastError = '';
+      function igHeaders(write) {
+        var headers = { 'x-ig-app-id': IG_APP_ID, 'x-requested-with': 'XMLHttpRequest' };
+        if (write) {
+          headers['x-csrftoken'] = csrfToken();
+          headers['x-asbd-id'] = '129477';
+          headers['content-type'] = 'application/x-www-form-urlencoded';
+        } else {
+          headers['accept'] = 'application/json';
         }
-        headers['x-ig-app-id'] = IG_APP_ID;
-        if (!headers['x-asbd-id']) headers['x-asbd-id'] = '129477';
-        var csrf = csrfToken();
-        if (csrf) headers['x-csrftoken'] = csrf;
-        headers['x-requested-with'] = 'XMLHttpRequest';
-        headers['accept'] = '*/*';
-        if (extra) Object.keys(extra).forEach(function (name) { headers[name] = extra[name]; });
         return headers;
       }
 
-      function igRequest(path, init, extra) {
-        function attempt(mode) {
-          var options = {};
-          Object.keys(init || {}).forEach(function (key) { options[key] = init[key]; });
-          options.credentials = 'include';
-          options.headers = igHeaders(extra, mode);
-          return fetch(path, options);
-        }
-        var mode = headerMode;
-        return attempt(mode).then(function (response) {
+      function igRequest(path, init) {
+        var options = {};
+        Object.keys(init || {}).forEach(function (key) { options[key] = init[key]; });
+        options.credentials = 'include';
+        options.headers = igHeaders(options.method === 'POST');
+        lastError = '';
+        return fetch(path, options).then(function (response) {
           lastStatus = response.status;
-          if (response.ok || mode !== 'borrowed' || response.status < 400 || response.status >= 500) return response;
-          return attempt('minimal').then(function (retry) {
-            lastStatus = retry.status;
-            if (retry.ok) headerMode = 'minimal';
-            return retry;
-          });
+          return response;
+        }, function (error) {
+          lastStatus = 0;
+          lastError = error && error.message ? error.message : String(error);
+          throw error;
         });
       }
 
       function igFetch(path) {
-        return igRequest(path, {}, { accept: 'application/json' })
-          .then(function (response) { return response.ok ? response.json() : null; });
+        return igRequest(path, {}).then(function (response) {
+          if (!response.ok) return null;
+          return response.json().catch(function (error) {
+            lastError = 'not JSON: ' + (error && error.message ? error.message : error);
+            return null;
+          });
+        });
+      }
+
+      function lastFailure() {
+        return lastStatus ? 'HTTP ' + lastStatus + (lastError ? ', ' + lastError : '') : (lastError || 'no response');
       }
 
       function timeAgo(takenAt) {
@@ -392,10 +345,17 @@ enum ContentFilterScript {
           if (json && Array.isArray(json.reels_media) && json.reels_media.length) data = json.reels_media[0];
           else if (json && json.reels && json.reels[key]) data = json.reels[key];
           var items = data && Array.isArray(data.items) ? data.items : [];
-          return { reelId: data && data.id ? String(data.id) : key, items: items };
-        }).catch(function () {
+          var why = '';
+          if (!items.length) {
+            if (!json) why = lastFailure();
+            else if (!data) why = 'not in response (' + Object.keys(json).join(',') + ')';
+            else why = 'no items';
+            delete reelCache[key]; // don't remember a failure
+          }
+          return { reelId: data && data.id ? String(data.id) : key, items: items, why: why };
+        }).catch(function (error) {
           delete reelCache[key];
-          return { reelId: key, items: [] };
+          return { reelId: key, items: [], why: 'error: ' + (error && error.message ? error.message : error) };
         });
         return reelCache[key];
       }
@@ -404,8 +364,7 @@ enum ContentFilterScript {
         return igRequest(path, {
           method: 'POST',
           body: new URLSearchParams(fields).toString()
-        }, { 'content-type': 'application/x-www-form-urlencoded' })
-          .then(function (response) { return response.ok; }).catch(function () { return false; });
+        }).then(function (response) { return response.ok; }).catch(function () { return false; });
       }
 
       // Instagram has moved its "seen" calls around over the years. Each
@@ -666,6 +625,15 @@ enum ContentFilterScript {
         setTimeout(function () { toast.remove(); }, 1600);
       }
 
+      // A note that outlives the viewer (it sits on the page, not in the
+      // viewer), for problems worth reporting after the viewer closes.
+      function docNote(message) {
+        var toast = el('div', 'position:fixed;left:50%;bottom:90px;transform:translateX(-50%);max-width:86%;padding:10px 16px;border-radius:12px;background:rgba(0,0,0,.88);color:#fff;font-size:13px;line-height:1.35;text-align:center;z-index:2147483001;word-break:break-word;pointer-events:none;');
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(function () { toast.remove(); }, 10000);
+      }
+
       function renderLike(liked, animate) {
         ui.likePath.setAttribute('fill', liked ? '#ff3040' : 'none');
         ui.likePath.setAttribute('stroke', liked ? '#ff3040' : '#fff');
@@ -918,7 +886,7 @@ enum ContentFilterScript {
         tick();
 
         if (!reel.items) markSeen(reel, state.reelId, item);
-        if (state.callbacks.onItemSeen) { try { state.callbacks.onItemSeen(reel.username, item.taken_at || 0); } catch (e) {} }
+        if (state.callbacks.onItemSeen) { try { state.callbacks.onItemSeen(reel.username, item.taken_at || 0, item); } catch (e) {} }
         preload(state.items[state.itemIndex + 1]);
         if (state.itemIndex === state.items.length - 1 && state.reels[state.userIndex + 1]) {
           loadReel(state.reels[state.userIndex + 1]).then(function (data) { preload(data.items[0]); });
@@ -944,6 +912,12 @@ enum ContentFilterScript {
           if (!state || token !== state.loadToken) return;
           if (!data.items.length) {
             // Nothing to show (expired, or the request failed): skip past.
+            // Say why once per session so a broken fetch is visible
+            // instead of looking like everyone's story just expired.
+            if (data.why && data.why !== 'no items' && !state.reportedEmpty) {
+              state.reportedEmpty = true;
+              docNote("Couldn't load " + reel.username + "'s story: " + data.why);
+            }
             var nextIndex = index + direction;
             if (nextIndex < 0 || nextIndex >= state.reels.length) closeViewer(); else showUser(nextIndex, fromEnd);
             return;
@@ -1055,9 +1029,8 @@ enum ContentFilterScript {
           get: igFetch,
           post: postForm,
           postFirstAccepted: postFirstAccepted,
-          headers: igHeaders,
           lastStatus: function () { return lastStatus; },
-          headerMode: function () { return headerMode; }
+          lastFailure: lastFailure
         }
       };
     })();
@@ -2229,24 +2202,57 @@ enum ContentFilterScript {
       var VISUAL_PLACEHOLDER = /use the (instagram )?(mobile )?app|only available (on|in) (the )?(instagram |mobile )?app|replayed once|view(ed)? once/i;
 
       // Catch a tap anywhere on a placeholder bubble, however Instagram
-      // happens to structure it, before its own handlers run.
-      function isVisualPlaceholderTap(target) {
+      // happens to structure it, before its own handlers run. Returns the
+      // bubble element (the innermost node carrying the placeholder text).
+      function visualPlaceholderBubble(target) {
         var node = target;
         for (var i = 0; i < 6 && node && node !== document.body; i++) {
           var text = node.textContent || '';
-          if (text.length < 200 && VISUAL_PLACEHOLDER.test(text)) return true;
+          if (text.length < 200 && VISUAL_PLACEHOLDER.test(text)) return node;
           node = node.parentElement;
         }
-        return false;
+        return null;
       }
-      document.addEventListener('click', function (event) {
+
+      // Every placeholder bubble in the conversation, top to bottom. Each
+      // corresponds, in order, to one disappearing photo / video the other
+      // person sent, which is how a tapped bubble maps to a thread item.
+      function visualPlaceholderBubbles() {
+        var all = document.body.querySelectorAll('span, div, p');
+        var bubbles = [];
+        for (var i = 0; i < all.length; i++) {
+          var node = all[i];
+          var text = node.textContent || '';
+          if (text.length >= 200 || !VISUAL_PLACEHOLDER.test(text)) continue;
+          // innermost only: skip if a child also carries the text
+          var inner = false;
+          for (var c = 0; c < node.children.length && !inner; c++) {
+            var childText = node.children[c].textContent || '';
+            if (VISUAL_PLACEHOLDER.test(childText)) inner = true;
+          }
+          if (!inner) bubbles.push(node);
+        }
+        return bubbles;
+      }
+
+      function onVisualPlaceholderTap(event) {
         var threadID = threadIDFromPath();
-        if (!threadID || !event.target || !isVisualPlaceholderTap(event.target)) return;
+        var bubble = event.target ? visualPlaceholderBubble(event.target) : null;
+        if (!threadID || !bubble) return;
         event.preventDefault();
         event.stopPropagation();
         event.stopImmediatePropagation();
-        openVisualMessages(threadID);
-      }, true);
+        var bubbles = visualPlaceholderBubbles();
+        var index = -1;
+        for (var i = 0; i < bubbles.length; i++) {
+          if (bubbles[i] === bubble || bubbles[i].contains(bubble) || bubble.contains(bubbles[i])) { index = i; break; }
+        }
+        // Position counted from the newest message, which is what the
+        // thread endpoint returns first.
+        var fromEnd = index < 0 ? 0 : bubbles.length - 1 - index;
+        openVisualMessage(threadID, fromEnd, bubble);
+      }
+      document.addEventListener('click', onVisualPlaceholderTap, true);
 
       function threadIDFromPath() {
         var match = /^\/direct\/t\/([^\/]+)/.exec(location.pathname);
@@ -2261,20 +2267,59 @@ enum ContentFilterScript {
         setTimeout(function () { note.remove(); }, duration || 2800);
       }
 
-      // Mark a disappearing photo / video viewed, the same way the story
-      // viewer marks stories: through its request layer (page-matching
-      // headers), trying the known endpoint shapes once and remembering
-      // the one the server accepts.
-      function markVisualMessageSeen(threadID, itemID) {
+      // Local record of which disappearing photos have been opened here,
+      // so a bubble can be shown as viewed even when Instagram's own seen
+      // call is refused. Item ids, newest last, capped.
+      var VISUAL_SEEN_KEY = 'insta-no-reels-visual-seen';
+      function loadVisualSeen() {
+        try { return JSON.parse(localStorage.getItem(VISUAL_SEEN_KEY) || '{}') || {}; } catch (e) { return {}; }
+      }
+      function recordVisualSeen(itemID) {
+        var seen = loadVisualSeen();
+        seen[itemID] = Date.now();
+        var ids = Object.keys(seen).sort(function (a, b) { return seen[a] - seen[b]; });
+        while (ids.length > 500) delete seen[ids.shift()];
+        try { localStorage.setItem(VISUAL_SEEN_KEY, JSON.stringify(seen)); } catch (e) {}
+      }
+      function ownUserID() {
+        var match = /(?:^|;\s*)ds_user_id=([^;]+)/.exec(document.cookie || '');
+        return match ? match[1] : '';
+      }
+      function markBubbleViewed(bubble) {
+        if (!bubble || !bubble.isConnected) return;
+        var target = bubble.closest('[role="button"], button, a') || bubble;
+        target.style.setProperty('opacity', '0.55');
+        target.style.setProperty('text-decoration', 'none');
+        if (!bubble.getAttribute('data-insta-no-reels-viewed')) {
+          bubble.setAttribute('data-insta-no-reels-viewed', 'true');
+          var tag = document.createElement('span');
+          tag.textContent = ' · Viewed';
+          tag.style.cssText = 'font-style:normal;opacity:.9;';
+          bubble.appendChild(tag);
+        }
+      }
+
+      // Mark a disappearing photo / video viewed on the server, through the
+      // story viewer's request layer, trying the known endpoint shapes and
+      // remembering the one that is accepted. The local record is kept
+      // regardless, so the bubble reads as viewed either way.
+      function markVisualMessageSeen(threadID, itemID, bubble) {
+        recordVisualSeen(itemID);
+        markBubbleViewed(bubble);
         var api = viewerAPI();
         if (!api) return;
         var thread = encodeURIComponent(threadID);
         var item = encodeURIComponent(itemID);
+        var csrf = (/(?:^|;\s*)csrftoken=([^;]+)/.exec(document.cookie || '') || [])[1] || '';
         api.postFirstAccepted('visualMessage', [
           function () {
             return api.post('/api/v1/direct_v2/visual_threads/' + thread + '/item_seen/', {
               item_ids: JSON.stringify([itemID]),
-              target_item_type: 'raven_media'
+              target_item_type: 'raven_media',
+              action: 'mark_seen',
+              thread_id: threadID,
+              _csrftoken: csrf,
+              _uuid: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now())
             });
           },
           function () {
@@ -2282,10 +2327,13 @@ enum ContentFilterScript {
               use_unified_inbox: 'true',
               action: 'mark_seen',
               thread_id: threadID,
-              item_id: itemID
+              item_id: itemID,
+              _csrftoken: csrf
             });
           }
-        ]);
+        ]).then(function (ok) {
+          if (!ok) toast("Instagram didn't accept the seen call (" + (api.lastFailure ? api.lastFailure() : 'HTTP ' + api.lastStatus()) + '); marked viewed locally.', 6000);
+        });
       }
 
       // Pull the media out of a thread item, whichever of the shapes
@@ -2301,37 +2349,47 @@ enum ContentFilterScript {
         return null;
       }
 
-      // Short description of what the thread returned, for the diagnostic
-      // note when nothing displayable was found.
-      function describeItems(items) {
-        var parts = [];
-        items.slice(0, 40).forEach(function (item) {
-          if (!/raven|visual|xma|media/.test(item.item_type || '')) return;
-          var desc = item.item_type;
-          var visual = item.visual_media || item.raven_media;
-          if (visual) {
-            desc += ' vm[' + Object.keys(visual).slice(0, 8).join(',') + ']';
-            if (visual.media) desc += ' media[' + Object.keys(visual.media).slice(0, 8).join(',') + ']';
-            if (visual.seen_count !== undefined) desc += ' seen=' + visual.seen_count;
-            if (visual.view_mode) desc += ' mode=' + visual.view_mode;
-          }
-          parts.push(desc);
-        });
-        return parts.length ? parts.slice(0, 4).join(' | ') : 'no visual items among ' + items.length;
-      }
-
-      function fetchThreadItems(threadID, variant) {
-        var query = variant === 0
-          ? 'visual_message_return_type=unseen&direction=older&limit=20'
-          : 'visual_message_return_type=all&direction=older&limit=20';
+      // One page of a thread, newest first. `variant` 0 asks for unseen
+      // visual messages only, 1 for all of them; `cursor` pages older.
+      function fetchThreadItems(threadID, variant, cursor) {
+        var query = 'visual_message_return_type=' + (variant === 0 ? 'unseen' : 'all') + '&direction=older&limit=20';
+        if (cursor) query += '&cursor=' + encodeURIComponent(cursor);
         return igFetch('/api/v1/direct_v2/threads/' + encodeURIComponent(threadID) + '/?' + query).then(function (json) {
           var thread = json && json.thread;
           return {
             thread: thread,
             items: thread && Array.isArray(thread.items) ? thread.items : [],
-            users: thread && Array.isArray(thread.users) ? thread.users : []
+            users: thread && Array.isArray(thread.users) ? thread.users : [],
+            olderCursor: thread && thread.has_older ? (thread.oldest_cursor || '') : ''
           };
         });
+      }
+
+      function isVisualItem(item) {
+        return !!(item && (/raven|visual/.test(item.item_type || '') || item.visual_media || item.raven_media));
+      }
+
+      // The other person's disappearing photos / videos, newest first,
+      // including ones already viewed (they still have a bubble). Pages
+      // older until at least `wanted` of them are known or the thread
+      // runs out, capped at a few pages.
+      function collectVisualItems(threadID, wanted) {
+        var me = ownUserID();
+        var visual = [];
+        var users = [];
+        var thread = null;
+        function page(cursor, pagesLeft) {
+          return fetchThreadItems(threadID, 1, cursor).then(function (result) {
+            if (!thread) thread = result.thread;
+            if (result.users.length) users = result.users;
+            result.items.forEach(function (item) {
+              if (isVisualItem(item) && String(item.user_id || '') !== me) visual.push(item);
+            });
+            if (visual.length <= wanted && result.olderCursor && pagesLeft > 0) return page(result.olderCursor, pagesLeft - 1);
+            return { thread: thread, users: users, visual: visual, status: viewerAPI() ? viewerAPI().lastFailure() : '' };
+          });
+        }
+        return page('', 3);
       }
 
       // The id in the /direct/t/<id> URL is not always the id the thread
@@ -2381,7 +2439,12 @@ enum ContentFilterScript {
         });
       }
 
-      function openVisualMessages(urlThreadID) {
+      // Open the one disappearing photo / video behind a tapped bubble:
+      // `fromEnd` is the bubble's position counted from the newest one.
+      var openingVisual = false;
+      function openVisualMessage(urlThreadID, fromEnd, bubble) {
+        if (openingVisual) return;
+        openingVisual = true;
         var threadID = urlThreadID;
         resolveThread(urlThreadID).then(function (resolved) {
           if (!resolved.id) {
@@ -2389,65 +2452,56 @@ enum ContentFilterScript {
             return null;
           }
           threadID = resolved.id;
-          return (resolved.first ? Promise.resolve(resolved.first) : fetchThreadItems(threadID, 0)).then(function (first) {
-          var collect = function (result) {
-            var media = [];
-            result.items.forEach(function (item) {
-              var m = visualMediaFrom(item);
-              if (!m) return;
-              if (!/raven|visual/.test(item.item_type || '') && !item.visual_media) return;
-              media.push({
-                pk: m.pk || item.item_id,
-                itemID: item.item_id,
-                senderID: String(item.user_id || ''),
-                media_type: m.media_type || (m.video_versions ? 2 : 1),
-                image_versions2: m.image_versions2,
-                video_versions: m.video_versions,
-                taken_at: item.timestamp ? Math.floor(item.timestamp / 1000000) : 0
-              });
-            });
-            return media;
-          };
-          var media = collect(first);
-          if (media.length) return { result: first, media: media };
-          return fetchThreadItems(threadID, 1).then(function (second) {
-            var more = collect(second);
-            return { result: more.length ? second : first, media: more };
-          });
-          });
+          return collectVisualItems(threadID, fromEnd);
         }).then(function (found) {
+          openingVisual = false;
           if (!found) return;
-          var media = found.media;
-          var thread = found.result.thread;
-          var users = found.result.users;
-          if (!media.length) {
-            var status = viewerAPI() ? viewerAPI().lastStatus() : 0;
-            toast('Nothing displayable came back (HTTP ' + status + ', thread ' + threadID + '). Details: ' + describeItems(found.result.items), 12000);
+          if (!found.visual.length) {
+            toast('No photos found in this chat (' + (found.status || 'thread ' + threadID) + ').', 8000);
             return;
           }
-          media.sort(function (a, b) { return a.taken_at - b.taken_at; });
-
+          var item = found.visual[fromEnd];
+          if (!item) {
+            toast('This photo is too far back to load (' + found.visual.length + ' found).', 6000);
+            return;
+          }
+          var m = visualMediaFrom(item);
+          if (!m) {
+            markBubbleViewed(bubble);
+            var visual = item.visual_media || item.raven_media || {};
+            var why = visual.seen_count ? 'already viewed' : (visual.view_mode === 'once' || visual.replay_expiring_at_us ? 'expired' : 'no media returned');
+            toast('This photo can\'t be shown: ' + why + '.', 5000);
+            return;
+          }
+          var media = {
+            pk: m.pk || item.item_id,
+            itemID: item.item_id,
+            senderID: String(item.user_id || ''),
+            media_type: m.media_type || (m.video_versions ? 2 : 1),
+            image_versions2: m.image_versions2,
+            video_versions: m.video_versions,
+            taken_at: item.timestamp ? Math.floor(item.timestamp / 1000000) : 0
+          };
           var sender = null;
-          for (var i = 0; i < users.length && !sender; i++) {
-            if (String(users[i].pk || users[i].pk_id || '') === media[0].senderID) sender = users[i];
+          for (var i = 0; i < found.users.length && !sender; i++) {
+            if (String(found.users[i].pk || found.users[i].pk_id || '') === media.senderID) sender = found.users[i];
           }
           var viewer = window.__instaNoReelsViewer;
           if (!viewer) return;
-          var byID = {};
-          media.forEach(function (m) { byID[m.taken_at] = m; });
           viewer.open([{
             userPk: 'dm-' + threadID,
-            username: sender ? sender.username : (thread.thread_title || 'Message'),
+            username: sender ? sender.username : ((found.thread && found.thread.thread_title) || 'Message'),
             pic: sender ? (sender.profile_pic_url || '') : '',
-            items: media
+            items: [media]
           }], 0, {
-            onItemSeen: function (username, takenAt) {
-              var m = byID[takenAt];
-              if (m) markVisualMessageSeen(threadID, m.itemID);
+            onItemSeen: function (username, takenAt, seenItem) {
+              var id = (seenItem && seenItem.itemID) || media.itemID;
+              markVisualMessageSeen(threadID, id, bubble);
             }
           });
-        }).catch(function () {
-          toast("Couldn't load the photo.");
+        }).catch(function (error) {
+          openingVisual = false;
+          toast("Couldn't load the photo: " + (error && error.message ? error.message : error), 6000);
         });
       }
 
@@ -2463,12 +2517,7 @@ enum ContentFilterScript {
             var target = el.closest('[role="button"], button, a') || el;
             target.style.setProperty('cursor', 'pointer');
             target.style.setProperty('text-decoration', 'underline');
-            target.addEventListener('click', function (event) {
-              event.preventDefault();
-              event.stopPropagation();
-              event.stopImmediatePropagation();
-              openVisualMessages(threadID);
-            }, true);
+            target.addEventListener('click', onVisualPlaceholderTap, true);
           });
         });
       }
